@@ -28,7 +28,7 @@ Let the cluster start properly, then open Rancher Desktop Preferences.
 
 ![pref_disable_traefik](./images/pref_disable_traefik.png)
 
-2. CPU and Memory- Give it as much as you can. Minimal will be 8Gb memory and 4 CPUs.
+2. CPU and Memory- Give it as much as you can. Minimum configuration is 8Gb memory and 4 CPUs.
 
 ![prefs_set_cpu_mem](./images/pref_cpu_mem.png)
 
@@ -46,7 +46,7 @@ Simply make it executable and run it. The script is split in 3 parts:
 2. Installing OpenChoreo
 3. Installing Agent Manager
 
-Each step has validation to ensure we are ready to move to the next one. 
+Each step has validation embedded, to ensure we are ready to move to the next one. 
 
 If all goes well, you should see this at the end of the execution.
 
@@ -66,7 +66,7 @@ Domains:
 ✓ Installation completed successfully!
 ```
 
-Be patient as some steps can take several minutes to run depending on the memoty / CPU you have set for the VM.
+Be patient as some steps can take several minutes to run depending on the memory / CPUs you have set for the VM.
 
 
 
