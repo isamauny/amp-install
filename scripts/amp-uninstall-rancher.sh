@@ -36,6 +36,9 @@ HELM_RELEASES=(
     "amp-evaluation-extension:${WORKFLOW_NS}"
     "amp-platform-resources:${DEFAULT_NS}"
     "gateway-operator:${DATA_PLANE_NS}"
+    "observability-logs-opensearch:${OBSERVABILITY_NS}"
+    "observability-metrics-prometheus:${OBSERVABILITY_NS}"
+    "observability-traces-opensearch:${OBSERVABILITY_NS}"
     "openchoreo-observability-plane:${OBSERVABILITY_NS}"
     "openchoreo-workflow-plane:${WORKFLOW_NS}"
     "openchoreo-data-plane:${DATA_PLANE_NS}"
@@ -154,6 +157,26 @@ kubectl delete clusterrole wso2-api-platform-gateway-module --ignore-not-found \
 # ============================================================================
 # STEP 5 — Delete namespaces
 # ============================================================================
+# Custom resources owned by the operators we just uninstalled in Step 3 (e.g.
+# gateway-operator's RestAPIs, external-secrets' ExternalSecrets) carry
+# finalizers that only their controller can clear. With the controller gone,
+# those finalizers never get removed and the namespace hangs in
+# "Terminating" forever. strip_stuck_finalizers force-clears finalizers on
+# whatever's left so namespace deletion can complete.
+strip_stuck_finalizers() {
+    local ns="$1"
+    local kinds
+    kinds=$(kubectl api-resources --verbs=list --namespaced -o name 2>/dev/null)
+    while IFS= read -r kind; do
+        [ -z "${kind}" ] && continue
+        while IFS= read -r name; do
+            [ -z "${name}" ] && continue
+            kubectl patch "${kind}" "${name}" -n "${ns}" --type=merge -p '{"metadata":{"finalizers":[]}}' &>/dev/null \
+                && warning "Cleared stuck finalizer(s) on ${kind}/${name} (${ns})"
+        done < <(kubectl get "${kind}" -n "${ns}" -o name 2>/dev/null | cut -d/ -f2)
+    done <<< "${kinds}"
+}
+
 step "Deleting namespaces"
 kubectl delete namespace "${NAMESPACES[@]}" --ignore-not-found --timeout=120s || true
 
@@ -168,6 +191,12 @@ while [ ${ELAPSED} -lt 180 ]; do
         fi
     done
     [ ${#STUCK[@]} -eq 0 ] && break
+    if [ ${ELAPSED} -eq 30 ]; then
+        info "Some namespaces are still terminating — checking for orphaned finalizers..."
+        for ns in "${STUCK[@]}"; do
+            strip_stuck_finalizers "${ns}"
+        done
+    fi
     sleep 5
     ELAPSED=$((ELAPSED+5))
 done

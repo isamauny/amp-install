@@ -65,9 +65,15 @@ wait_for() {
 
 check_helm_release() {
     local name="$1" ns="$2"
-    if helm status "${name}" -n "${ns}" &>/dev/null; then
-        warning "Helm release '${name}' already exists in namespace '${ns}' — skipping install"
+    local status
+    status=$(helm status "${name}" -n "${ns}" -o json 2>/dev/null \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin).get("info",{}).get("status",""))' 2>/dev/null || echo "")
+    if [ "${status}" = "deployed" ]; then
+        warning "Helm release '${name}' already deployed in namespace '${ns}' — skipping install"
         return 0
+    elif [ -n "${status}" ]; then
+        warning "Helm release '${name}' exists in namespace '${ns}' with status '${status}' — retrying install"
+        return 1
     fi
     return 1
 }
@@ -82,6 +88,64 @@ verify_pods() {
         warning "${not_ready} pod(s) in ${ns} not yet Running:"
         kubectl get pods -n "${ns}" --no-headers | { grep -v -E 'Running|Completed' || true; }
     fi
+}
+
+# Retries a helm command that can transiently fail while the Control Plane's
+# own admission webhook (controller-manager-webhook-service) has no endpoints
+# yet — e.g. "failed calling webhook ... no endpoints available for service".
+# The chart applies webhook-validated CRs (ClusterAuthzRoleBinding) in the same
+# apply as the controller-manager Deployment, so the very first apply can race
+# the webhook's pod becoming ready. Retrying a few times, with a wait for
+# deployments in between, gives it time to catch up.
+retry_helm() {
+    local desc="$1"; shift
+    local attempt=0
+    local max_attempts=6
+    local err_log
+    err_log=$(mktemp)
+    until "$@" 2>"${err_log}"; do
+        attempt=$((attempt+1))
+        if [ ${attempt} -ge ${max_attempts} ]; then
+            error "${desc} — FAILED after ${max_attempts} attempts"
+            cat "${err_log}" >&2
+            rm -f "${err_log}"
+            return 1
+        fi
+        if grep -q "no endpoints available for service" "${err_log}"; then
+            warning "${desc}: Control Plane webhook not ready yet — retrying in 15s (attempt ${attempt}/${max_attempts})..."
+        else
+            warning "${desc}: helm command failed — retrying in 15s (attempt ${attempt}/${max_attempts})..."
+        fi
+        sleep 15
+        kubectl wait --for=condition=Available deployment --all \
+            -n openchoreo-control-plane --timeout=120s 2>/dev/null || true
+    done
+    rm -f "${err_log}"
+    success "${desc} succeeded"
+}
+
+# Generic retry wrapper for commands that can fail while some other resource
+# is still propagating/syncing elsewhere in the cluster (e.g. a newly created
+# Environment CR that OpenChoreo/Agent Manager hasn't picked up yet). Unlike
+# retry_helm, this doesn't assume anything about the Control Plane namespace.
+retry_cmd() {
+    local desc="$1" max_attempts="$2" delay="$3"; shift 3
+    local attempt=0
+    local err_log
+    err_log=$(mktemp)
+    until "$@" 2>"${err_log}"; do
+        attempt=$((attempt+1))
+        if [ ${attempt} -ge ${max_attempts} ]; then
+            error "${desc} — FAILED after ${max_attempts} attempts"
+            cat "${err_log}" >&2
+            rm -f "${err_log}"
+            return 1
+        fi
+        warning "${desc}: failed (attempt ${attempt}/${max_attempts}) — retrying in ${delay}s..."
+        sleep "${delay}"
+    done
+    rm -f "${err_log}"
+    success "${desc} succeeded"
 }
 
 # ============================================================================
@@ -182,7 +246,8 @@ info "Gateway CRDs present: ${CRD_COUNT}"
 # ── Step 2: cert-manager ─────────────────────────────────────────────────────
 step "cert-manager (v1.19.2)"
 if ! check_helm_release cert-manager cert-manager; then
-    helm upgrade --install cert-manager oci://quay.io/jetstack/charts/cert-manager \
+    retry_cmd "cert-manager install" 3 15 \
+        helm upgrade --install cert-manager oci://quay.io/jetstack/charts/cert-manager \
         --namespace cert-manager \
         --create-namespace \
         --version v1.19.2 \
@@ -197,7 +262,8 @@ verify_pods cert-manager
 # ── Step 3: External Secrets Operator ────────────────────────────────────────
 step "External Secrets Operator (v1.3.2)"
 if ! check_helm_release external-secrets external-secrets; then
-    helm upgrade --install external-secrets oci://ghcr.io/external-secrets/charts/external-secrets \
+    retry_cmd "external-secrets install" 3 15 \
+        helm upgrade --install external-secrets oci://ghcr.io/external-secrets/charts/external-secrets \
         --namespace external-secrets \
         --create-namespace \
         --version 1.3.2 \
@@ -211,13 +277,15 @@ verify_pods external-secrets
 # ── Step 4: kgateway ─────────────────────────────────────────────────────────
 step "kgateway (v2.2.1)"
 if ! check_helm_release kgateway-crds openchoreo-control-plane; then
-    helm upgrade --install kgateway-crds oci://cr.kgateway.dev/kgateway-dev/charts/kgateway-crds \
+    retry_cmd "kgateway-crds install" 3 15 \
+        helm upgrade --install kgateway-crds oci://cr.kgateway.dev/kgateway-dev/charts/kgateway-crds \
         --create-namespace \
         --namespace openchoreo-control-plane \
         --version v2.2.1
 fi
 if ! check_helm_release kgateway openchoreo-control-plane; then
-    helm upgrade --install kgateway oci://cr.kgateway.dev/kgateway-dev/charts/kgateway \
+    retry_cmd "kgateway install" 3 15 \
+        helm upgrade --install kgateway oci://cr.kgateway.dev/kgateway-dev/charts/kgateway \
         --namespace openchoreo-control-plane \
         --create-namespace \
         --version v2.2.1 \
@@ -230,7 +298,8 @@ verify_pods openchoreo-control-plane
 # ── Step 5: OpenBao ──────────────────────────────────────────────────────────
 step "OpenBao secrets store (v0.25.6)"
 if ! check_helm_release openbao openbao; then
-    helm upgrade --install openbao oci://ghcr.io/openbao/charts/openbao \
+    retry_cmd "OpenBao install" 3 15 \
+        helm upgrade --install openbao oci://ghcr.io/openbao/charts/openbao \
         --namespace openbao \
         --create-namespace \
         --version 0.25.6 \
@@ -341,13 +410,8 @@ fi
 # ── Step 8: Control Plane ────────────────────────────────────────────────────
 step "OpenChoreo Control Plane (v1.1.1)"
 info "Installing with placeholder hostnames first..."
-if ! check_helm_release openchoreo-control-plane openchoreo-control-plane; then
-    helm upgrade --install openchoreo-control-plane \
-        oci://ghcr.io/openchoreo/helm-charts/openchoreo-control-plane \
-        --version 1.1.1 \
-        --namespace openchoreo-control-plane \
-        --create-namespace \
-        --values - <<'EOF'
+CP_PLACEHOLDER_VALUES=$(mktemp)
+cat > "${CP_PLACEHOLDER_VALUES}" <<'EOF'
 openchoreoApi:
   http:
     hostnames:
@@ -365,7 +429,16 @@ gateway:
   tls:
     enabled: false
 EOF
+if ! check_helm_release openchoreo-control-plane openchoreo-control-plane; then
+    retry_helm "Control Plane initial install" \
+        helm upgrade --install openchoreo-control-plane \
+        oci://ghcr.io/openchoreo/helm-charts/openchoreo-control-plane \
+        --version 1.1.1 \
+        --namespace openchoreo-control-plane \
+        --create-namespace \
+        --values "${CP_PLACEHOLDER_VALUES}"
 fi
+rm -f "${CP_PLACEHOLDER_VALUES}"
 
 # Handle webhook race condition
 # Wait for all deployments to be available first, then retry helm upgrade
@@ -374,24 +447,12 @@ info "Waiting for Control Plane deployments to be ready..."
 kubectl wait --for=condition=Available deployment --all \
     -n openchoreo-control-plane --timeout=300s 2>/dev/null || true
 
-RETRY=0
-until [ $RETRY -ge 5 ]; do
-    RETRY=$((RETRY+1))
-    info "Applying ClusterAuthzRoleBindings via helm upgrade (attempt ${RETRY}/5)..."
-    if helm upgrade openchoreo-control-plane \
-        oci://ghcr.io/openchoreo/helm-charts/openchoreo-control-plane \
-        --version 1.1.1 \
-        --namespace openchoreo-control-plane \
-        --reuse-values 2>/dev/null; then
-        success "Control Plane helm upgrade succeeded"
-        break
-    fi
-    warning "Webhook not ready yet, waiting 15s before retry..."
-    sleep 15
-    # Re-wait for deployments in case something restarted
-    kubectl wait --for=condition=Available deployment --all \
-        -n openchoreo-control-plane --timeout=120s 2>/dev/null || true
-done
+retry_helm "Control Plane ClusterAuthzRoleBindings" \
+    helm upgrade openchoreo-control-plane \
+    oci://ghcr.io/openchoreo/helm-charts/openchoreo-control-plane \
+    --version 1.1.1 \
+    --namespace openchoreo-control-plane \
+    --reuse-values
 
 wait_for "Control Plane deployments" \
     kubectl wait --for=condition=Available deployment --all \
@@ -446,12 +507,8 @@ wait_for "CP TLS certificate" \
 
 # Reconfigure with real hostnames
 info "Reconfiguring Control Plane with real hostnames and TLS..."
-helm upgrade openchoreo-control-plane \
-    oci://ghcr.io/openchoreo/helm-charts/openchoreo-control-plane \
-    --version 1.1.1 \
-    --namespace openchoreo-control-plane \
-    --reuse-values \
-    --values - <<EOF
+CP_REAL_VALUES=$(mktemp)
+cat > "${CP_REAL_VALUES}" <<EOF
 openchoreoApi:
   config:
     server:
@@ -484,6 +541,14 @@ gateway:
     certificateRefs:
       - name: cp-gateway-tls
 EOF
+retry_helm "Control Plane reconfigure (real hostnames)" \
+    helm upgrade openchoreo-control-plane \
+    oci://ghcr.io/openchoreo/helm-charts/openchoreo-control-plane \
+    --version 1.1.1 \
+    --namespace openchoreo-control-plane \
+    --reuse-values \
+    --values "${CP_REAL_VALUES}"
+rm -f "${CP_REAL_VALUES}"
 wait_for "Control Plane reconfigured" \
     kubectl wait --for=condition=Available deployment --all \
     -n openchoreo-control-plane --timeout=300s
@@ -995,7 +1060,16 @@ success "Evaluation Extension installed"
 # ── Step 18: API Platform Gateway Extension ───────────────────────────────────
 step "API Platform Gateway Extension (v${VERSION})"
 if ! check_helm_release api-platform-default-default "${DATA_PLANE_NS}"; then
-    helm install api-platform-default-default \
+    # The chart's pre-install hook (bootstrap Job) looks up the 'default'
+    # Environment via the Agent Manager API, which reads it from OpenChoreo.
+    # That Environment CR was just created a couple of steps ago (Platform
+    # Resources) and can take a little while to propagate through to the
+    # API, so the bootstrap Job — and therefore this helm install — can fail
+    # on the first try even though nothing is actually broken. Retry the
+    # whole install (helm upgrade --install, so a failed release can be
+    # retried) rather than requiring a manual re-run of the script.
+    retry_cmd "API Platform Gateway Extension install" 4 20 \
+        helm upgrade --install api-platform-default-default \
         oci://${HELM_CHART_REGISTRY}/wso2-amp-api-platform-gateway-extension \
         --version ${VERSION} \
         --namespace ${DATA_PLANE_NS} \
@@ -1054,6 +1128,37 @@ json.dump(data, sys.stdout)
 done
 
 # ============================================================================
+# WAIT FOR ALL PODS TO BE READY
+# ============================================================================
+# The summary below and the port-forwards after it assume every pod in these
+# namespaces is up. Without this wait, a pod that's still starting (e.g. a
+# slow image pull or late-starting sidecar) can make a port-forward target a
+# service with no ready endpoints yet, which fails silently later rather than
+# at the point where it's actually diagnosable.
+step "Waiting for all pods to be ready"
+ALL_NS=(openchoreo-control-plane openchoreo-data-plane openchoreo-workflow-plane \
+        openchoreo-observability-plane wso2-amp amp-thunder)
+WAIT_ELAPSED=0
+WAIT_MAX=300
+NOT_READY_TOTAL=1
+while [ ${WAIT_ELAPSED} -lt ${WAIT_MAX} ]; do
+    NOT_READY_TOTAL=0
+    for ns in "${ALL_NS[@]}"; do
+        NOT_READY_TOTAL=$((NOT_READY_TOTAL + $(kubectl get pods -n "${ns}" --no-headers 2>/dev/null \
+            | { grep -v -E 'Running|Completed' || true; } | wc -l | tr -d ' ')))
+    done
+    [ "${NOT_READY_TOTAL}" -eq 0 ] && break
+    info "Waiting for ${NOT_READY_TOTAL} pod(s) across all namespaces to finish starting... (${WAIT_ELAPSED}s/${WAIT_MAX}s)"
+    sleep 10
+    WAIT_ELAPSED=$((WAIT_ELAPSED+10))
+done
+if [ "${NOT_READY_TOTAL}" -eq 0 ]; then
+    success "All pods are Running/Completed"
+else
+    warning "Some pods still not Running after ${WAIT_MAX}s — see Pod Status below; affected port-forwards will be skipped"
+fi
+
+# ============================================================================
 # FINAL SUMMARY
 # ============================================================================
 echo ""
@@ -1109,6 +1214,13 @@ sleep 1
 
 start_portforward() {
     local desc="$1" ns="$2" svc="$3" ports="$4"
+    local endpoint_count
+    endpoint_count=$(kubectl get endpoints "${svc}" -n "${ns}" \
+        -o jsonpath='{.subsets[*].addresses}' 2>/dev/null | tr -d '[:space:]')
+    if [ -z "${endpoint_count}" ] || [ "${endpoint_count}" = "[]" ]; then
+        warning "${desc}: service '${svc}' (${ns}) has no ready endpoints yet — skipping port-forward"
+        return
+    fi
     kubectl port-forward -n "${ns}" "svc/${svc}" "${ports}" \
         > "/tmp/pf-${svc}.log" 2>&1 &
     local PID=$!

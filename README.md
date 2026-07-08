@@ -88,3 +88,11 @@ It asks for confirmation before touching the cluster (pass `-y`/`--yes` to skip 
 
 Cluster-scoped CRDs (Gateway API, cert-manager) are intentionally left in place — they're shared infrastructure, not part of the Agent Manager release, and the installer already handles re-applying them safely on the next run.
 
+> [!NOTE]
+>
+> A namespace can occasionally get stuck in `Terminating`. This happens when a custom resource inside it (e.g. a `RestAPI` from gateway-operator, or an `ExternalSecret`) still has a finalizer set, but the operator that owns that finalizer was already removed by the Helm uninstall step — so nothing is left to clear it. The script detects this automatically and force-clears any leftover finalizers on stuck namespaces so deletion can complete; if it still doesn't resolve, inspect the namespace's conditions for the specific resource holding it up:
+>
+> ```shell
+> kubectl get namespace <ns> -o json | jq '.status.conditions'
+> ```
+
