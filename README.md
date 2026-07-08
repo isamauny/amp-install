@@ -74,3 +74,17 @@ Be patient as some steps can take several minutes to run depending on the memory
 >
 > Execution of the script is idempotent. You can run it multiple times, even if for some reason it fails to execute at some point.
 
+## Uninstalling Agent Manager
+
+To remove everything the installer set up (for example, to reinstall a different version), run `scripts/amp-uninstall-rancher.sh`. It reverses the install script's steps: it removes the plane registrations, uninstalls all the Helm releases, and deletes the namespaces used by Agent Manager and OpenChoreo.
+
+```shell
+./scripts/amp-uninstall-rancher.sh
+```
+
+It also cleans up the handful of cluster-scoped resources the installer creates via raw `kubectl apply` (a `ClusterSecretStore`, two `ClusterIssuer`s, and a `ClusterRole`/`ClusterRoleBinding`) — these aren't part of any Helm release or namespace, so they'd otherwise survive uninstall unnoticed.
+
+It asks for confirmation before touching the cluster (pass `-y`/`--yes` to skip the prompt), and finishes with a validation pass confirming no matching Helm releases, namespaces, plane registrations, or cluster-scoped extras remain, plus a check for any `PersistentVolume`s still referencing the deleted namespaces (worth a look if your StorageClass's reclaim policy is `Retain` rather than `Delete`).
+
+Cluster-scoped CRDs (Gateway API, cert-manager) are intentionally left in place — they're shared infrastructure, not part of the Agent Manager release, and the installer already handles re-applying them safely on the next run.
+
