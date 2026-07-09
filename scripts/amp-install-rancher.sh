@@ -25,8 +25,9 @@ export THUNDER_INTERNAL_URL="http://amp-thunder-extension-service.${THUNDER_NS}.
 export CONSOLE_PUBLIC_URL="http://localhost:3000"
 export API_PUBLIC_URL="http://localhost:9000"
 export OBS_API_PUBLIC_URL="http://localhost:9098"
-export INSTRUMENTATION_URL="http://localhost:22893/otel"
-
+# INSTRUMENTATION_URL is finalized once the Data Plane LB IP/domain are known
+# (see Step 9) — it's exposed through gateway-default's LB rather than a
+# kubectl port-forward, to be easily reachable from the agents code.
 # ============================================================================
 # COLORS & HELPERS
 # ============================================================================
@@ -608,6 +609,16 @@ fi
 export DP_DOMAIN="apps.openchoreo.${DP_LB_IP//./-}.nip.io"
 success "Data Plane domain: ${DP_DOMAIN}"
 
+# Instrumentation (OTel) traffic is routed through gateway-default's HTTP
+# listener via an HTTPRoute created in Step 18, once the OTel gateway-runtime
+# backend service exists. It shares the DP LB IP (no separate LoadBalancer
+# needed). Plain HTTP is used because the gateway's TLS cert is signed by the
+# self-signed openchoreo-ca, which browsers won't trust by default; the
+# route is also bound to the HTTPS listener (19443) for callers that do
+# trust that CA.
+export OTEL_DOMAIN="otel.${DP_DOMAIN}"
+export INSTRUMENTATION_URL="http://${OTEL_DOMAIN}:19080/otel"
+
 kubectl apply -f - <<EOF
 apiVersion: cert-manager.io/v1
 kind: Certificate
@@ -810,6 +821,7 @@ wait_for "ExternalSecrets sync" \
 kubectl apply -f https://raw.githubusercontent.com/wso2/agent-manager/amp/v${VERSION}/deployments/values/oc-collector-configmap.yaml \
     -n openchoreo-observability-plane
 
+# Add issuer (not done in the official install docs)
 if ! check_helm_release openchoreo-observability-plane openchoreo-observability-plane; then
     helm install openchoreo-observability-plane \
         oci://ghcr.io/openchoreo/helm-charts/openchoreo-observability-plane \
@@ -820,6 +832,7 @@ if ! check_helm_release openchoreo-observability-plane openchoreo-observability-
         --set clusterAgent.tls.generateCerts=true \
         --set observer.controlPlaneApiUrl="http://openchoreo-api.openchoreo-control-plane.svc.cluster.local:8080" \
         --set observer.extraEnv.AUTH_SERVER_BASE_URL="${THUNDER_PUBLIC_URL}" \
+        --set security.oidc.issuer="${THUNDER_PUBLIC_URL}" \
         --set security.oidc.jwksUrl="${THUNDER_INTERNAL_URL}/oauth2/jwks" \
         --set security.oidc.tokenUrl="${THUNDER_INTERNAL_URL}/oauth2/token" \
         --set-string security.oidc.jwksUrlTlsInsecureSkipVerify=true \
@@ -1036,10 +1049,19 @@ success "Platform Resources installed"
 # ── Step 16: Observability Extension ─────────────────────────────────────────
 step "Observability Extension — Traces Observer (v${VERSION})"
 if ! check_helm_release amp-observability-traces "${OBSERVABILITY_NS}"; then
+    # tracesObserver.auth.issuer must match the Thunder issuer used
+    # everywhere else (agentManagerService.config.keyManager.issuer in Step
+    # 14, security.oidc.issuer in the Control Plane) — it defaults to
+    # http://thunder.amp.localhost:8080, which doesn't match the actual
+    # THUNDER_PUBLIC_URL, causing the traces-observer pod to reject every
+    # token with "JWT validation failed: invalid issuer".
+    # Fix added on top of the official install docs.
+
     helm install amp-observability-traces \
         oci://${HELM_CHART_REGISTRY}/wso2-amp-observability-extension \
         --version ${VERSION} \
         --namespace ${OBSERVABILITY_NS} \
+        --set tracesObserver.auth.issuer="${THUNDER_PUBLIC_URL}" \
         --timeout 1800s
 fi
 wait_for "Traces Observer" \
@@ -1083,6 +1105,43 @@ wait_for "API Platform bootstrap job" \
 
 kubectl apply -f https://raw.githubusercontent.com/wso2/agent-manager/amp/v${VERSION}/deployments/values/otel-collector-rest-api.yaml
 success "OTel collector RestApi applied"
+
+# Expose the OTel gateway-runtime backend externally via gateway-default, so
+# INSTRUMENTATION_URL is reachable from a browser without a kubectl
+# port-forward. Kept as its own HTTPRoute (rather than editing the chart's
+# own api-platform-default-default-gw-route) so it survives helm upgrades.
+# No sectionName on the parentRef: this attaches to every listener whose
+# hostname matches (both http/19080 and https/19443) via a single parentRef
+# entry. Gateway API itself allows repeating the parentRef once per
+# sectionName instead, but the gateway-operator controller that also
+# reconciles routes on this Gateway rejects multiple parentRefs pointing at
+# the same Gateway ("use a single parent Gateway"), so the sectionName-less
+# form is required here even though kgateway alone would accept either.
+# Path is restricted to "/otel" — the context path of the
+# amp-otel-collector-tracing-rest-api RestApi CR (context "/otel" + operation
+# "/v1/traces"); the bare gateway-runtime backend 404s on anything else.
+kubectl apply -f - <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: otel-gateway-external
+  namespace: ${DATA_PLANE_NS}
+spec:
+  parentRefs:
+    - name: gateway-default
+      namespace: ${DATA_PLANE_NS}
+  hostnames:
+    - "${OTEL_DOMAIN}"
+  rules:
+    - backendRefs:
+        - name: api-platform-default-default-gateway-gateway-runtime
+          port: 22893
+      matches:
+        - path:
+            type: PathPrefix
+            value: /otel
+EOF
+success "OTel gateway exposed at ${INSTRUMENTATION_URL}"
 
 # Verify gateway status
 GW_STATUS=$(kubectl get apigateway api-platform-default-default \
@@ -1192,6 +1251,7 @@ echo ""
 echo -e "${BOLD}Domains:${NC}"
 echo -e "  OpenChoreo API: https://api.${CP_BASE_DOMAIN}"
 echo -e "  Data Plane:     ${DP_DOMAIN}"
+echo -e "  OTel Gateway:   ${INSTRUMENTATION_URL}"
 
 echo ""
 if [ ${ERRORS} -eq 0 ]; then
@@ -1236,7 +1296,8 @@ start_portforward "Console"         wso2-amp                           amp-conso
 start_portforward "API"             wso2-amp                           amp-api                                                      9000:9000
 start_portforward "Thunder"         amp-thunder                        amp-thunder-extension-service                                8090:8090
 start_portforward "Traces Observer" openchoreo-observability-plane     amp-traces-observer                                          9098:9098
-start_portforward "OTel Gateway"    openchoreo-data-plane              api-platform-default-default-gateway-gateway-runtime         22893:22893
+# OTel Gateway is exposed via gateway-default's LoadBalancer (see Step 18),
+# not a port-forward — it needs to be reachable from the browser, not just localhost.
 
 # Save a helper script for future sessions
 cat > ~/amp-portforward.sh << 'EOF'
@@ -1248,13 +1309,12 @@ kubectl port-forward -n wso2-amp svc/amp-console 3000:3000 > /tmp/pf-console.log
 kubectl port-forward -n wso2-amp svc/amp-api 9000:9000 > /tmp/pf-api.log 2>&1 &
 kubectl port-forward -n amp-thunder svc/amp-thunder-extension-service 8090:8090 > /tmp/pf-thunder.log 2>&1 &
 kubectl port-forward -n openchoreo-observability-plane svc/amp-traces-observer 9098:9098 > /tmp/pf-traces.log 2>&1 &
-kubectl port-forward -n openchoreo-data-plane svc/api-platform-default-default-gateway-gateway-runtime 22893:22893 > /tmp/pf-otel.log 2>&1 &
 echo "AMP port-forwards started"
 echo "  Console:  http://localhost:3000  (admin / admin)"
 echo "  API:      http://localhost:9000"
 echo "  Thunder:  http://localhost:8090"
 echo "  Traces:   http://localhost:9098"
-echo "  OTel:     http://localhost:22893/otel"
+echo "  OTel:     reachable via gateway-default's LoadBalancer (see 'OTel Gateway' domain printed at install time — it doesn't need a port-forward)"
 EOF
 chmod +x ~/amp-portforward.sh
 success "Port-forward helper saved -> ~/amp-portforward.sh"
@@ -1265,6 +1325,6 @@ echo -e "  Console:  ${GREEN}http://localhost:3000${NC}  (admin / admin)"
 echo -e "  API:      http://localhost:9000"
 echo -e "  Thunder:  http://localhost:8090"
 echo -e "  Traces:   http://localhost:9098"
-echo -e "  OTel:     http://localhost:22893/otel"
+echo -e "  OTel:     ${INSTRUMENTATION_URL}"
 echo ""
 echo -e "${BOLD}After future restarts run:${NC} ~/amp-portforward.sh"
