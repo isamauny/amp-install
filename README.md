@@ -12,6 +12,10 @@ Installing Rancher desktop also provisions kubectl, helm as well as some docker 
 >
 > Once Rancher Desktop is installed, start a *new* terminal to execute the script, so that your PATH is updated - The script checks for prereqs and if they can't be found, it is most likely because you're executing from a shell that was opened before Rancher was installed.
 
+> [!WARNING]
+>
+> Agent Manager requires **Helm v3.12+**, but recent Rancher Desktop versions bundle **Helm 4** as `helm` on PATH. Helm 4's hook lifecycle (used by cert-manager's `startupapicheck`, the Agent Sandbox Module, and others installed here) has been observed to hang indefinitely on this setup — confirmed by re-running the exact same chart install with Helm 3, which succeeded in seconds every time Helm 4 hung. The installer checks for this and exits early with a fix if it detects Helm 4+. To install Helm 3 alongside Rancher Desktop's Helm 4: `brew install helm@3`, then put it ahead on PATH: `export PATH="/opt/homebrew/opt/helm@3/bin:$PATH"` (it's keg-only, so this won't disturb the existing `helm` link).
+
 ## Cluster Configuration
 
 When you start Rancher Desktop, it provisions a Kubernetes cluster automatically. However we need to edit some preferences before installing. A window will pop up where you can set a few options. 
@@ -38,7 +42,7 @@ You are ready to install!
 
 ## Agent Manager installation
 
-The script provided in this project is mirroring instructions provided here: https://wso2.github.io/agent-manager/docs/v0.17.x/getting-started/on-your-environment/. 
+The script provided in this project is mirroring instructions provided here: https://wso2.github.io/agent-manager/docs/v1.0.0-alpha1/getting-started/on-your-environment/. This branch tracks the v1.0.0-alpha1 pre-release — expect rough edges, since some steps below are adapted from production/DNS-based instructions to this script's port-forward/nip.io-based local setup and haven't been fully validated yet.
 
 Simply make it executable and run it. The script is split in 3 parts:
 

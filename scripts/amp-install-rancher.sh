@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# WSO2 Agent Manager v0.17.0 - Automated Installation Script
+# WSO2 Agent Manager v1.0.0-alpha1 - Automated Installation Script
 # Target: Rancher Desktop (k3s) on macOS
 # ============================================================================
 set -euo pipefail
@@ -8,7 +8,7 @@ set -euo pipefail
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-export VERSION="0.17.0"
+export VERSION="1.0.0-alpha1"
 export HELM_CHART_REGISTRY="ghcr.io/wso2"
 export AMP_NS="wso2-amp"
 export BUILD_CI_NS="openchoreo-workflow-plane"
@@ -170,7 +170,24 @@ success "kubectl found"
 if ! helm version &>/dev/null; then
     error "helm not found"; exit 1
 fi
-success "helm found"
+HELM_MAJOR_VERSION=$(helm version --short 2>/dev/null | sed -E 's/^v([0-9]+)\..*/\1/')
+if [ "${HELM_MAJOR_VERSION}" != "3" ]; then
+    echo ""
+    echo -e "${RED}${BOLD}✗ Helm $(helm version --short 2>/dev/null) found — this installer requires Helm v3.12+${NC}"
+    echo ""
+    echo "  Helm 4's hook lifecycle (used by cert-manager's startupapicheck, the"
+    echo "  agent-sandbox chart, and others installed here) has been observed to"
+    echo "  hang indefinitely on this environment — confirmed by installing the"
+    echo "  same chart with Helm 3, which succeeded in seconds every time Helm 4"
+    echo "  hung. Rancher Desktop currently bundles Helm 4 as \`helm\` on PATH."
+    echo ""
+    echo -e "  ${BOLD}Fix: brew install helm@3${NC}, then put it ahead of Rancher Desktop's"
+    echo -e "  helm on PATH: ${BOLD}export PATH=\"/opt/homebrew/opt/helm@3/bin:\$PATH\"${NC}"
+    echo "  (helm@3 is keg-only, so it won't overwrite the existing helm@4 link)"
+    echo ""
+    exit 1
+fi
+success "helm found ($(helm version --short 2>/dev/null))"
 
 # docker-credential-osxkeychain (required for OCI Helm chart pulls)
 if ! which docker-credential-osxkeychain &>/dev/null; then
@@ -380,6 +397,12 @@ success "TLS CA chain ready"
 # ── Step 7: Thunder (Identity Provider) ──────────────────────────────────────
 step "Thunder Identity Provider (v${VERSION})"
 if ! check_helm_release amp-thunder-extension "${THUNDER_NS}"; then
+    # v1.0.0-alpha1's chart added cors.allowedOrigins and
+    # bootstrap.ampConsoleClient.redirectUris — without them the console's
+    # login redirect from Thunder is rejected. ocIngress.hostname and
+    # gateClient.scheme=https from the official docs are intentionally
+    # skipped: this setup reaches Thunder only via `kubectl port-forward` on
+    # plain HTTP, not through a gateway ingress.
     helm install amp-thunder-extension \
         oci://${HELM_CHART_REGISTRY}/wso2-amp-thunder-extension \
         --version ${VERSION} \
@@ -389,6 +412,8 @@ if ! check_helm_release amp-thunder-extension "${THUNDER_NS}"; then
         --set thunder.configuration.jwt.issuer="${THUNDER_PUBLIC_URL}" \
         --set thunder.configuration.gateClient.hostname="localhost" \
         --set thunder.configuration.gateClient.port=8090 \
+        --set "thunder.configuration.cors.allowedOrigins={${CONSOLE_PUBLIC_URL}}" \
+        --set "thunder.bootstrap.ampConsoleClient.redirectUris={${CONSOLE_PUBLIC_URL}/login}" \
         --timeout 1800s
 fi
 wait_for "Thunder deployment" \
@@ -554,6 +579,38 @@ wait_for "Control Plane reconfigured" \
     kubectl wait --for=condition=Available deployment --all \
     -n openchoreo-control-plane --timeout=300s
 verify_pods openchoreo-control-plane
+
+# Thunder >= 0.45 issues 'client_id' as the entitlement claim instead of
+# 'sub' — new/required in v1.0.0-alpha1. Without this patch, every
+# ClusterAuthzRoleBinding still matches on the old 'sub' claim and every API
+# call gets silently unauthorized (this looks exactly like the v0.18.0
+# authz bug diagnosed earlier: 403s / empty lists despite a correctly
+# configured binding).
+info "Patching openchoreo-api-config entitlement claim for Thunder >= 0.45..."
+patched_yaml=$(kubectl get configmap openchoreo-api-config -n openchoreo-control-plane -o yaml \
+    | sed -E "s/claim:[[:space:]]*['\"]?sub['\"]?/claim: client_id/g")
+echo "$patched_yaml" | kubectl apply --server-side --field-manager=helm --force-conflicts -f -
+
+kubectl rollout restart deployment/openchoreo-api -n openchoreo-control-plane
+kubectl rollout status deployment/openchoreo-api -n openchoreo-control-plane --timeout=120s
+
+for binding in $(kubectl get clusterauthzrolebindings.openchoreo.dev -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+    claim=$(kubectl get clusterauthzrolebinding.openchoreo.dev "$binding" -o jsonpath='{.spec.entitlement.claim}' 2>/dev/null || echo "")
+    if [ "$claim" = "sub" ]; then
+        # --field-manager=helm (not the kubectl-patch default): this script
+        # unconditionally re-applies these same CRs via `helm upgrade
+        # --reuse-values` on every run (see "Control Plane
+        # ClusterAuthzRoleBindings"/"reconfigure" above), as field manager
+        # "helm". If this patch took ownership under the default
+        # "kubectl-patch" manager instead, every later re-run's server-side
+        # apply would conflict on this exact field with "Apply failed with 1
+        # conflict: conflict with \"kubectl-patch\"".
+        kubectl patch clusterauthzrolebinding.openchoreo.dev "$binding" --type=merge \
+            --field-manager=helm \
+            -p '{"spec":{"entitlement":{"claim":"client_id"}}}'
+    fi
+done
+success "Entitlement claim patched to client_id"
 
 # ── Step 9: Data Plane ───────────────────────────────────────────────────────
 step "OpenChoreo Data Plane (v1.1.1)"
@@ -848,6 +905,17 @@ for sts in $(kubectl get statefulset -n openchoreo-observability-plane -o name 2
     kubectl rollout status "${sts}" -n openchoreo-observability-plane --timeout=900s
 done
 
+# Same Thunder >= 0.45 entitlement-claim fix as the Control Plane, applied to
+# the Observability Plane's own "observer" deployment/ConfigMap (not to be
+# confused with the AMP-specific Traces Observer extension installed later).
+info "Patching observer-auth-config entitlement claim for Thunder >= 0.45..."
+patched_yaml=$(kubectl get configmap observer-auth-config -n openchoreo-observability-plane -o yaml \
+    | sed -E "s/claim:[[:space:]]*['\"]?sub['\"]?/claim: client_id/g")
+echo "$patched_yaml" | kubectl apply --server-side --field-manager=helm --force-conflicts -f -
+
+kubectl rollout restart deployment/observer -n openchoreo-observability-plane
+kubectl rollout status deployment/observer -n openchoreo-observability-plane --timeout=120s
+
 # Observability modules
 info "Installing observability modules (logs, metrics, traces)..."
 helm upgrade --install observability-logs-opensearch \
@@ -1008,6 +1076,12 @@ success "Gateway Operator RBAC configured"
 # ── Step 14: Agent Manager Core ──────────────────────────────────────────────
 step "Agent Manager (API + Console + PostgreSQL) v${VERSION}"
 if ! check_helm_release amp "${AMP_NS}"; then
+    # v1.0.0-alpha1 renamed console.config.obsApiBaseUrl to
+    # agentManagerService.config.amObserverPublicURL, and added
+    # agentManagerService.config.serverPublicURL. console.ocIngress.hostname
+    # and agentManagerService.ocIngress.hostname from the official docs are
+    # intentionally skipped: this setup reaches Console/API via port-forward,
+    # not a gateway ingress.
     helm install amp \
         oci://${HELM_CHART_REGISTRY}/wso2-agent-manager \
         --version ${VERSION} \
@@ -1018,7 +1092,8 @@ if ! check_helm_release amp "${AMP_NS}"; then
         --set console.config.auth.signInRedirectURL="${CONSOLE_PUBLIC_URL}/login" \
         --set console.config.auth.signOutRedirectURL="${CONSOLE_PUBLIC_URL}/login" \
         --set console.config.apiBaseUrl="${API_PUBLIC_URL}" \
-        --set console.config.obsApiBaseUrl="${OBS_API_PUBLIC_URL}" \
+        --set agentManagerService.config.amObserverPublicURL="${OBS_API_PUBLIC_URL}" \
+        --set agentManagerService.config.serverPublicURL="${API_PUBLIC_URL}" \
         --set agentManagerService.config.keyManager.issuer="${THUNDER_PUBLIC_URL}" \
         --set agentManagerService.config.keyManager.jwksUrl="${THUNDER_INTERNAL_URL}/oauth2/jwks" \
         --set agentManagerService.config.oidc.tokenUrl="${THUNDER_INTERNAL_URL}/oauth2/token" \
@@ -1035,40 +1110,84 @@ wait_for "AMP Console" \
     kubectl wait --for=condition=Available deployment/amp-console -n ${AMP_NS} --timeout=600s
 verify_pods "${AMP_NS}"
 
-# ── Step 15: Platform Resources ──────────────────────────────────────────────
+# ── Step 15: Agent Sandbox Module ────────────────────────────────────────────
+# New in v1.0.0-alpha1 — provides the sandboxed-pod controller (isolation
+# tiers) that deployed agents run in.
+step "Agent Sandbox Module (v0.1.1)"
+if ! check_helm_release agent-sandbox "${DATA_PLANE_NS}"; then
+    # This chart's pre-install/pre-upgrade hook (a Job) both creates its own
+    # RBAC/ServiceAccount AND does a live `kubectl apply` of the upstream
+    # kubernetes-sigs/agent-sandbox manifest fetched from GitHub. Observed
+    # hanging twice on this Lima VM before even the ServiceAccount is
+    # created — same class of Helm/Lima-VM stall as cert-manager's
+    # startupapicheck, just earlier in the hook lifecycle. Wrapped in
+    # retry_cmd so a Ctrl+C'd/failed attempt self-heals on retry instead of
+    # requiring a manual script restart.
+    retry_cmd "Agent Sandbox Module install" 3 15 \
+        helm upgrade --install agent-sandbox \
+        oci://ghcr.io/openchoreo/helm-charts/agent-sandbox \
+        --version 0.1.1 \
+        --namespace ${DATA_PLANE_NS} \
+        --create-namespace \
+        --wait \
+        --timeout 10m \
+        --set namespace=openchoreo-control-plane \
+        --set dataPlaneNamespace=${DATA_PLANE_NS} \
+        --set dataPlaneServiceAccount=cluster-agent-dataplane \
+        --set upstream.version=v0.4.6
+fi
+wait_for "Agent Sandbox controller" \
+    kubectl wait -n agent-sandbox-system \
+    --for=condition=available --timeout=180s \
+    deployment/agent-sandbox-controller
+verify_pods agent-sandbox-system
+
+# ── Step 16: Platform Resources ──────────────────────────────────────────────
 step "Platform Resources (v${VERSION})"
 if ! check_helm_release amp-platform-resources "${DEFAULT_NS}"; then
+    # global.oauth.tokenUrl and environment.gateway.* are new in
+    # v1.0.0-alpha1 and wire deployed-agent invoke URLs to the actual Data
+    # Plane gateway (DP_DOMAIN, computed in the Data Plane step) — without
+    # them, deployed agents' invoke URLs point at the chart's placeholder
+    # default instead of this cluster's real gateway.
     helm install amp-platform-resources \
         oci://${HELM_CHART_REGISTRY}/wso2-amp-platform-resources-extension \
         --version ${VERSION} \
         --namespace ${DEFAULT_NS} \
+        --set global.oauth.tokenUrl="${THUNDER_INTERNAL_URL}/oauth2/token" \
+        --set environment.gateway.http.host="${DP_DOMAIN}" \
+        --set environment.gateway.http.port=80 \
+        --set environment.gateway.https.host="${DP_DOMAIN}" \
+        --set environment.gateway.https.port=443 \
         --timeout 1800s
 fi
 success "Platform Resources installed"
 
-# ── Step 16: Observability Extension ─────────────────────────────────────────
+# ── Step 17: Observability Extension ─────────────────────────────────────────
 step "Observability Extension — Traces Observer (v${VERSION})"
 if ! check_helm_release amp-observability-traces "${OBSERVABILITY_NS}"; then
-    # tracesObserver.auth.issuer must match the Thunder issuer used
-    # everywhere else (agentManagerService.config.keyManager.issuer in Step
-    # 14, security.oidc.issuer in the Control Plane) — it defaults to
-    # http://thunder.amp.localhost:8080, which doesn't match the actual
-    # THUNDER_PUBLIC_URL, causing the traces-observer pod to reject every
-    # token with "JWT validation failed: invalid issuer".
-    # Fix added on top of the official install docs.
-
+    # v1.0.0-alpha1 renamed this chart's values from tracesObserver.* to
+    # amObserver.* (and the deployment from amp-traces-observer to
+    # amp-observer). The docs set amObserver.ocIngress.hostname/publicUrl for
+    # a real ingress; this setup uses a port-forward instead, so publicUrl is
+    # pointed at the local port-forward URL. No issuer override is shown for
+    # this chart in the alpha docs (unlike v0.17.x/v0.18.x, where
+    # tracesObserver.auth.issuer had to be set explicitly to avoid an
+    # "invalid issuer" error) — verify on first run whether amObserver still
+    # needs one; if the pod rejects tokens with "invalid issuer" again, add
+    # --set amObserver.auth.issuer="${THUNDER_PUBLIC_URL}" back.
     helm install amp-observability-traces \
         oci://${HELM_CHART_REGISTRY}/wso2-amp-observability-extension \
         --version ${VERSION} \
         --namespace ${OBSERVABILITY_NS} \
-        --set tracesObserver.auth.issuer="${THUNDER_PUBLIC_URL}" \
+        --set amObserver.publicUrl="${OBS_API_PUBLIC_URL}" \
         --timeout 1800s
 fi
 wait_for "Traces Observer" \
-    kubectl wait --for=condition=Available deployment/amp-traces-observer \
+    kubectl wait --for=condition=Available deployment/amp-observer \
     -n ${OBSERVABILITY_NS} --timeout=600s
 
-# ── Step 17: Evaluation Extension ────────────────────────────────────────────
+# ── Step 18: Evaluation Extension ────────────────────────────────────────────
 step "Evaluation Extension (v${VERSION})"
 if ! check_helm_release amp-evaluation-extension "${BUILD_CI_NS}"; then
     helm install amp-evaluation-extension \
@@ -1079,7 +1198,7 @@ if ! check_helm_release amp-evaluation-extension "${BUILD_CI_NS}"; then
 fi
 success "Evaluation Extension installed"
 
-# ── Step 18: API Platform Gateway Extension ───────────────────────────────────
+# ── Step 19: API Platform Gateway Extension ───────────────────────────────────
 step "API Platform Gateway Extension (v${VERSION})"
 if ! check_helm_release api-platform-default-default "${DATA_PLANE_NS}"; then
     # The chart's pre-install hook (bootstrap Job) looks up the 'default'
@@ -1103,8 +1222,15 @@ wait_for "API Platform bootstrap job" \
     kubectl wait --for=condition=complete job/api-platform-default-default-bootstrap \
     -n ${DATA_PLANE_NS} --timeout=300s
 
-kubectl apply -f https://raw.githubusercontent.com/wso2/agent-manager/amp/v${VERSION}/deployments/values/otel-collector-rest-api.yaml
-success "OTel collector RestApi applied"
+# The docs' manual `kubectl apply` of otel-collector-rest-api.yaml is skipped
+# here: as of v1.0.0-alpha1 that manifest is superseded by a chart-managed
+# RestApi (see its own header comment) — the API Platform Gateway Extension
+# chart above already creates api-platform-default-default-otel-restapi with
+# the same jwt-auth/context-path config, carrying the
+# gateway.api-platform.wso2.com/restapi-target label. Applying the old
+# manifest anyway 404s: it targets a "default-default" namespace that the
+# chart-managed flow no longer creates.
+success "OTel collector RestApi already provisioned by the chart"
 
 # Expose the OTel gateway-runtime backend externally via gateway-default, so
 # INSTRUMENTATION_URL is reachable from a browser without a kubectl
@@ -1153,7 +1279,7 @@ else
     warning "API Gateway status: ${GW_STATUS} (may still be initializing)"
 fi
 
-# ── Step 19: Rancher Desktop cgroup fix ──────────────────────────────────────
+# ── Step 20: Rancher Desktop cgroup fix ──────────────────────────────────────
 step "Applying Rancher Desktop cgroup pids workaround"
 info "Patching ClusterWorkflowTemplates for cgroup compatibility..."
 
@@ -1196,7 +1322,7 @@ done
 # at the point where it's actually diagnosable.
 step "Waiting for all pods to be ready"
 ALL_NS=(openchoreo-control-plane openchoreo-data-plane openchoreo-workflow-plane \
-        openchoreo-observability-plane wso2-amp amp-thunder)
+        openchoreo-observability-plane wso2-amp amp-thunder agent-sandbox-system)
 WAIT_ELAPSED=0
 WAIT_MAX=300
 NOT_READY_TOTAL=1
@@ -1227,7 +1353,7 @@ echo -e "${BOLD}═════════════════════�
 echo ""
 
 echo -e "${BOLD}Helm Releases:${NC}"
-helm list -A | grep -E 'openchoreo|amp|gateway|openbao|cert-manager|external-secrets' || true
+helm list -A | grep -E 'openchoreo|amp|gateway|openbao|cert-manager|external-secrets|agent-sandbox' || true
 
 echo ""
 echo -e "${BOLD}Plane Registrations:${NC}"
@@ -1236,7 +1362,7 @@ kubectl get clusterdataplane,clusterworkflowplane,observabilityplane -n default 
 echo ""
 echo -e "${BOLD}Pod Status:${NC}"
 for ns in openchoreo-control-plane openchoreo-data-plane openchoreo-workflow-plane \
-          openchoreo-observability-plane wso2-amp amp-thunder; do
+          openchoreo-observability-plane wso2-amp amp-thunder agent-sandbox-system; do
     NOT_READY=$(kubectl get pods -n "${ns}" --no-headers 2>/dev/null \
         | { grep -v -E 'Running|Completed' || true; } | wc -l | tr -d ' ')
     TOTAL=$(kubectl get pods -n "${ns}" --no-headers 2>/dev/null | wc -l | tr -d ' ')
@@ -1295,7 +1421,12 @@ start_portforward() {
 start_portforward "Console"         wso2-amp                           amp-console                                                  3000:3000
 start_portforward "API"             wso2-amp                           amp-api                                                      9000:9000
 start_portforward "Thunder"         amp-thunder                        amp-thunder-extension-service                                8090:8090
-start_portforward "Traces Observer" openchoreo-observability-plane     amp-traces-observer                                          9098:9098
+# Service name "amp-observer" is a best-effort guess matching the
+# amp-api/amp-console naming convention (same name as its deployment) since
+# the alpha docs only show an ingress hostname for this component, not a
+# port-forwardable service name — verify with `kubectl get svc -n
+# openchoreo-observability-plane` on first run if this fails.
+start_portforward "Traces Observer" openchoreo-observability-plane     amp-observer                                                 9098:9098
 # OTel Gateway is exposed via gateway-default's LoadBalancer (see Step 18),
 # not a port-forward — it needs to be reachable from the browser, not just localhost.
 
@@ -1308,7 +1439,7 @@ sleep 1
 kubectl port-forward -n wso2-amp svc/amp-console 3000:3000 > /tmp/pf-console.log 2>&1 &
 kubectl port-forward -n wso2-amp svc/amp-api 9000:9000 > /tmp/pf-api.log 2>&1 &
 kubectl port-forward -n amp-thunder svc/amp-thunder-extension-service 8090:8090 > /tmp/pf-thunder.log 2>&1 &
-kubectl port-forward -n openchoreo-observability-plane svc/amp-traces-observer 9098:9098 > /tmp/pf-traces.log 2>&1 &
+kubectl port-forward -n openchoreo-observability-plane svc/amp-observer 9098:9098 > /tmp/pf-traces.log 2>&1 &
 echo "AMP port-forwards started"
 echo "  Console:  http://localhost:3000  (admin / admin)"
 echo "  API:      http://localhost:9000"
