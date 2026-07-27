@@ -1170,17 +1170,35 @@ if ! check_helm_release amp-observability-traces "${OBSERVABILITY_NS}"; then
     # amObserver.* (and the deployment from amp-traces-observer to
     # amp-observer). The docs set amObserver.ocIngress.hostname/publicUrl for
     # a real ingress; this setup uses a port-forward instead, so publicUrl is
-    # pointed at the local port-forward URL. No issuer override is shown for
-    # this chart in the alpha docs (unlike v0.17.x/v0.18.x, where
-    # tracesObserver.auth.issuer had to be set explicitly to avoid an
-    # "invalid issuer" error) — verify on first run whether amObserver still
-    # needs one; if the pod rejects tokens with "invalid issuer" again, add
-    # --set amObserver.auth.issuer="${THUNDER_PUBLIC_URL}" back.
+    # pointed at the local port-forward URL.
+    #
+    # The issuer override still has to be carried over from v0.17.x/v0.18.x
+    # (where it was tracesObserver.auth.issuer). The chart defaults
+    # amObserver.auth.issuer to "http://thunder.amp.localhost:8080", but Thunder
+    # is deployed here with jwt.issuer=${THUNDER_PUBLIC_URL} (see Step 6), so
+    # every token it mints carries iss=http://localhost:8090. Without the
+    # override the observer rejects every console request with
+    # "JWT validation failed: invalid issuer" -> 401 on GET /api/v1/traces, and
+    # traces are collected fine but never render in the UI. Note this is the
+    # retrieval leg only: publishing goes through the OTel gateway and is
+    # unaffected. agentManagerService.config.keyManager.issuer (Step 15) is set
+    # from the same variable — the two must agree or only one of them accepts
+    # the console's token.
+    #
+    # oauth.authorizationServers is what the observer advertises in its RFC 9728
+    # protected-resource metadata and the chart requires it to match auth.issuer,
+    # so it has to move in lockstep.
+    #
+    # auth.audience needs no override: Thunder v0.45+ stamps the resource-server
+    # identifier "amp" as the audience on scoped tokens, and the chart default
+    # ("amp,amp-api-client") already covers that.
     helm install amp-observability-traces \
         oci://${HELM_CHART_REGISTRY}/wso2-amp-observability-extension \
         --version ${VERSION} \
         --namespace ${OBSERVABILITY_NS} \
         --set amObserver.publicUrl="${OBS_API_PUBLIC_URL}" \
+        --set amObserver.auth.issuer="${THUNDER_PUBLIC_URL}" \
+        --set amObserver.oauth.authorizationServers="${THUNDER_PUBLIC_URL}" \
         --timeout 1800s
 fi
 wait_for "Traces Observer" \
