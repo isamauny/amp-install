@@ -1,0 +1,38 @@
+# Project metadata and dependencies.
+#
+# Agent Manager's build uses Google Cloud Buildpacks (gcr.io/buildpacks/builder).
+# Its Python group runs google.python.runtime (required) followed by
+# google.python.pip, google.python.webserver and google.config.entrypoint (all
+# optional), so this file is what the runtime buildpack detects and installs
+# from when the Procfile is not honoured.
+#
+# NOTE ON PRECEDENCE: Google's Python buildpack docs state that when a project
+# has BOTH pyproject.toml and requirements.txt, "the requirements.txt file takes
+# precedence". Both are kept here so the build works either way — which means
+# the dependency lists below and in requirements.txt MUST be kept in sync.
+# If you edit one, edit the other.
+
+[project]
+name = "langchain-chat-agent"
+version = "1.0.0"
+description = "Minimal LangChain chat agent used to verify a WSO2 Agent Manager deployment end to end."
+requires-python = ">=3.11"
+
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.34",
+  "pydantic>=2.9",
+
+  # langchain-anthropic wraps the official Anthropic SDK.
+  "langchain-anthropic>=0.3",
+  "langchain-core>=0.3",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# The app is a single top-level module, not a package. Stating it explicitly
+# stops setuptools' auto-discovery from failing on a flat layout.
+py-modules = ["main"]

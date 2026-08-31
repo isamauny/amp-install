@@ -33,6 +33,36 @@ SYSTEM_PROMPT = os.getenv(
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "16000"))
 MAX_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "20"))
 
+# Where to send model calls.
+#
+# Inside Agent Manager, LLM traffic is proxied through the environment's
+# embedded gateway rather than going straight to api.anthropic.com — that is
+# what applies the platform's governance (token and cost-based rate limiting,
+# guardrails) and what makes the calls show up in the console. Point this at the
+# gateway's LLM proxy and the agent needs no change.
+#
+# LLM_BASE_URL is checked first so the platform's own variable name can be
+# mapped onto it without editing code; ANTHROPIC_BASE_URL / ANTHROPIC_API_URL
+# are the names the Anthropic SDK and langchain-anthropic already recognise.
+# Unset = call the Anthropic API directly, which is what happens when you run
+# this locally.
+LLM_BASE_URL = (
+    os.getenv("LLM_BASE_URL")
+    or os.getenv("ANTHROPIC_BASE_URL")
+    or os.getenv("ANTHROPIC_API_URL")
+    or ""
+).strip()
+
+# Which header carries the key to the gateway.
+#
+# Not hardcoded, because it is the gateway's choice and it is NOT the SDK's
+# default: the Anthropic SDK sends its key as `x-api-key`, while the platform's
+# own API keys are read from `x-amp-api-key` (that is the header on the
+# gateway's otel RestApi). Leave unset for the SDK's normal behaviour — which is
+# what you want when calling the Anthropic API directly.
+LLM_AUTH_HEADER = os.getenv("LLM_AUTH_HEADER", "").strip()
+LLM_AUTH_KEY = (os.getenv("LLM_AUTH_KEY") or os.getenv("ANTHROPIC_API_KEY") or "").strip()
+
 app = FastAPI(title="LangChain Chat Agent", version="1.0.0")
 
 _history: dict[str, list[BaseMessage]] = defaultdict(list)
@@ -41,16 +71,44 @@ _llm: ChatAnthropic | None = None
 
 def llm() -> ChatAnthropic:
     """Built lazily so the container still starts (and /healthz answers) when
-    ANTHROPIC_API_KEY is missing — otherwise the pod crash-loops and the
+    the model configuration is missing — otherwise the pod crash-loops and the
     platform reports a deployment failure rather than a configuration one."""
     global _llm
     if _llm is None:
-        if not os.getenv("ANTHROPIC_API_KEY"):
-            raise RuntimeError(
-                "ANTHROPIC_API_KEY is not set. Add it as an environment variable "
-                "on the agent in the Agent Manager console."
-            )
-        _llm = ChatAnthropic(model=MODEL, max_tokens=MAX_TOKENS, timeout=120)
+        api_key = LLM_AUTH_KEY
+        if not api_key:
+            if not LLM_BASE_URL:
+                raise RuntimeError(
+                    "No model endpoint configured. Set ANTHROPIC_API_KEY to call "
+                    "the Anthropic API directly, or LLM_BASE_URL to route through "
+                    "the environment's gateway LLM proxy."
+                )
+            # Behind the gateway proxy the upstream provider credential is held
+            # by the gateway, not the agent. The SDK still requires a non-empty
+            # key, so send a placeholder rather than failing here.
+            api_key = "proxied-by-gateway"
+
+        kwargs: dict[str, Any] = {
+            "model": MODEL,
+            "max_tokens": MAX_TOKENS,
+            "timeout": 120,
+            "api_key": api_key,
+        }
+        if LLM_BASE_URL:
+            kwargs["base_url"] = LLM_BASE_URL
+        if LLM_AUTH_HEADER and LLM_AUTH_KEY:
+            # Sent in addition to the SDK's own x-api-key, not instead of it —
+            # the gateway reads the header it was configured with and ignores
+            # the other.
+            kwargs["default_headers"] = {LLM_AUTH_HEADER: LLM_AUTH_KEY}
+
+        _llm = ChatAnthropic(**kwargs)
+        log.info(
+            "model=%s endpoint=%s auth_header=%s",
+            MODEL,
+            LLM_BASE_URL or "https://api.anthropic.com",
+            LLM_AUTH_HEADER or "x-api-key (SDK default)",
+        )
     return _llm
 
 
@@ -127,45 +185,21 @@ def reset(session_id: str) -> dict[str, str]:
     return {"status": "cleared", "session_id": session_id}
 
 
-# --- OpenTelemetry (optional) -------------------------------------------------
-# Agent Manager ingests traces at INSTRUMENTATION_URL, authenticated with an API
-# key in the x-amp-api-key header (no "Bearer" prefix). Both are set as
-# environment variables on the agent. Failing soft is deliberate: a broken trace
-# exporter should not stop the agent from answering.
-def _init_tracing() -> None:
-    endpoint = os.getenv("INSTRUMENTATION_URL", "").strip()
-    api_key = os.getenv("AMP_API_KEY", "").strip()
-    if not endpoint or not api_key:
-        log.info("tracing disabled (INSTRUMENTATION_URL or AMP_API_KEY unset)")
-        return
-    try:
-        from opentelemetry import trace
-        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-        from opentelemetry.sdk.resources import Resource
-        from opentelemetry.sdk.trace import TracerProvider
-        from opentelemetry.sdk.trace.export import BatchSpanProcessor
-
-        provider = TracerProvider(
-            resource=Resource.create(
-                {"service.name": os.getenv("OTEL_SERVICE_NAME", "langchain-chat-agent")}
-            )
-        )
-        provider.add_span_processor(
-            BatchSpanProcessor(
-                OTLPSpanExporter(
-                    # The exporter needs the full signal path; INSTRUMENTATION_URL
-                    # is the /otel base.
-                    endpoint=f"{endpoint.rstrip('/')}/v1/traces",
-                    headers={"x-amp-api-key": api_key},
-                )
-            )
-        )
-        trace.set_tracer_provider(provider)
-        FastAPIInstrumentor.instrument_app(app)
-        log.info("tracing enabled -> %s/v1/traces", endpoint.rstrip("/"))
-    except Exception:  # noqa: BLE001 - never block startup on telemetry
-        log.exception("tracing setup failed; continuing without it")
+# No OpenTelemetry setup here on purpose.
+#
+# Agent Manager instruments deployed agents itself — traces reach the platform
+# through the environment's embedded gateway, not from an exporter inside this
+# process. Configuring a second exporter here would duplicate spans and add a
+# credential (an API key that does not survive a platform upgrade) for no gain.
+# Run this locally and it simply emits nothing.
 
 
-_init_tracing()
+if __name__ == "__main__":
+    # Lets the container start with a plain `python main.py`, which is what runs
+    # when the Procfile is not honoured and the platform supplies its own
+    # command. Binding 0.0.0.0 is required — the default 127.0.0.1 is not
+    # reachable from outside the pod, and the endpoint would time out rather
+    # than refuse, which is markedly harder to diagnose.
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
