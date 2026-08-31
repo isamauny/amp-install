@@ -20,10 +20,18 @@ OPENBAO_NS="openbao"
 EXTERNAL_SECRETS_NS="external-secrets"
 CERT_MANAGER_NS="cert-manager"
 DEFAULT_NS="default"
+SANDBOX_NS="agent-sandbox-system"
+# Each Environment gets its own Thunder, named <release>-<org>-<env>. Only the
+# default Environment's is created by the installer; any added later needs
+# removing by hand.
+ENV_THUNDER_NS="amp-thunder-default-default"
+# Base domain whose /etc/hosts entries and CoreDNS rewrite the installer added
+# (local profile only). Override to match a non-default install.
+BASE_DOMAIN="${BASE_DOMAIN:-local.apis.coach}"
 
 NAMESPACES=(
-    "${AMP_NS}" "${THUNDER_NS}" "${OBSERVABILITY_NS}" "${WORKFLOW_NS}" \
-    "${DATA_PLANE_NS}" "${CONTROL_PLANE_NS}" "${OPENBAO_NS}" \
+    "${AMP_NS}" "${THUNDER_NS}" "${ENV_THUNDER_NS}" "${OBSERVABILITY_NS}" "${WORKFLOW_NS}" \
+    "${DATA_PLANE_NS}" "${CONTROL_PLANE_NS}" "${SANDBOX_NS}" "${OPENBAO_NS}" \
     "${EXTERNAL_SECRETS_NS}" "${CERT_MANAGER_NS}"
 )
 
@@ -32,9 +40,11 @@ HELM_RELEASES=(
     "amp:${AMP_NS}"
     "api-platform-default-default:${DATA_PLANE_NS}"
     "amp-thunder-extension:${THUNDER_NS}"
+    "${ENV_THUNDER_NS}:${ENV_THUNDER_NS}"
     "amp-observability-traces:${OBSERVABILITY_NS}"
     "amp-evaluation-extension:${WORKFLOW_NS}"
     "amp-platform-resources:${DEFAULT_NS}"
+    "agent-sandbox:${DATA_PLANE_NS}"
     "gateway-operator:${DATA_PLANE_NS}"
     "observability-logs-opensearch:${OBSERVABILITY_NS}"
     "observability-metrics-prometheus:${OBSERVABILITY_NS}"
@@ -117,8 +127,11 @@ kubectl delete clusterdataplane default -n default --ignore-not-found --timeout=
     && success "ClusterDataPlane deleted" || warning "ClusterDataPlane delete reported an issue (may already be gone)"
 kubectl delete clusterworkflowplane default -n default --ignore-not-found --timeout=60s \
     && success "ClusterWorkflowPlane deleted" || warning "ClusterWorkflowPlane delete reported an issue (may already be gone)"
-kubectl delete observabilityplane default -n default --ignore-not-found --timeout=60s \
-    && success "ObservabilityPlane deleted" || warning "ObservabilityPlane delete reported an issue (may already be gone)"
+# Also try the bare ObservabilityPlane kind, which is what installs before the
+# RC2 update registered.
+kubectl delete clusterobservabilityplane default --ignore-not-found --timeout=60s &>/dev/null \
+    || kubectl delete observabilityplane default -n default --ignore-not-found --timeout=60s &>/dev/null || true
+success "Observability plane registration deleted"
 
 # ============================================================================
 # STEP 3 — Uninstall Helm releases
@@ -153,6 +166,23 @@ kubectl delete clusterrolebinding wso2-api-platform-gateway-module --ignore-not-
     && success "ClusterRoleBinding/wso2-api-platform-gateway-module deleted" || warning "ClusterRoleBinding delete reported an issue"
 kubectl delete clusterrole wso2-api-platform-gateway-module --ignore-not-found \
     && success "ClusterRole/wso2-api-platform-gateway-module deleted" || warning "ClusterRole delete reported an issue"
+# The agent-sandbox chart's hook applies the upstream kubernetes-sigs manifest
+# cluster-wide, so its CRDs and RBAC outlive the release.
+kubectl delete clusterrole openchoreo-agent-sandbox-access --ignore-not-found &>/dev/null || true
+kubectl delete crd sandboxtemplates.extensions.agents.x-k8s.io \
+    sandboxwarmpools.extensions.agents.x-k8s.io \
+    sandboxclaims.extensions.agents.x-k8s.io --ignore-not-found &>/dev/null \
+    && success "Agent Sandbox CRDs deleted" || info "Agent Sandbox CRDs not present"
+# The env-Thunder HTTPRoute lives in the control-plane namespace (the shared
+# gateway only admits routes from its own namespace), so it is not removed by
+# deleting the env-Thunder namespace.
+kubectl delete httproute "${ENV_THUNDER_NS}" -n "${CONTROL_PLANE_NS}" --ignore-not-found &>/dev/null || true
+# In-cluster DNS rewrites for the local profile's base domain.
+if kubectl get cm coredns-custom -n kube-system &>/dev/null; then
+    kubectl delete cm coredns-custom -n kube-system --ignore-not-found &>/dev/null \
+        && success "coredns-custom removed" || warning "Could not remove coredns-custom"
+    kubectl rollout restart deployment/coredns -n kube-system &>/dev/null || true
+fi
 
 # ============================================================================
 # STEP 5 — Delete namespaces
@@ -241,12 +271,12 @@ else
 fi
 
 info "Checking plane registrations..."
-PLANES=$(kubectl get clusterdataplane,clusterworkflowplane,observabilityplane -n default --no-headers 2>/dev/null | wc -l | tr -d ' ')
+PLANES=$(kubectl get clusterdataplane,clusterworkflowplane,clusterobservabilityplane -n default --no-headers 2>/dev/null | wc -l | tr -d ' ')
 if [ "${PLANES}" -eq 0 ]; then
     success "No plane registrations remain"
 else
     error "Plane registrations still present:"
-    kubectl get clusterdataplane,clusterworkflowplane,observabilityplane -n default 2>/dev/null || true
+    kubectl get clusterdataplane,clusterworkflowplane,clusterobservabilityplane -n default 2>/dev/null || true
     CLEAN=false
 fi
 
@@ -272,6 +302,15 @@ if [ -z "${RELEASED_PVS}" ]; then
 else
     warning "PersistentVolume(s) still reference deleted namespaces (check reclaim policy):"
     echo "${RELEASED_PVS}"
+fi
+
+# /etc/hosts is outside the cluster, so nothing above touches it. Leaving the
+# entries in place is harmless for a reinstall onto the same base domain —
+# they point at 127.0.0.1 either way — so this only reports.
+if grep -q "${BASE_DOMAIN}" /etc/hosts 2>/dev/null; then
+    echo ""
+    info "/etc/hosts still has entries for ${BASE_DOMAIN}"
+    info "Keep them to reinstall onto the same domain, or remove with: scripts/amp-hosts.sh remove"
 fi
 
 echo ""

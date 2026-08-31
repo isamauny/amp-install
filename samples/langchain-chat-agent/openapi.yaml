@@ -1,0 +1,71 @@
+# Endpoint schema for the Agent Manager console.
+#
+# Point the agent's endpoint at this file via "Schema file path" =
+# /openapi.yaml when creating the agent. The build's generate-workload step
+# reads it out of the checked-out source and embeds it in the Workload CR, which
+# is what makes the console's try-out form render fields instead of a raw body.
+#
+# Kept hand-written rather than exported from FastAPI so it stays readable and
+# does not drift into $ref indirection.
+openapi: 3.0.3
+info:
+  title: LangChain Chat Agent
+  version: 1.0.0
+  description: Minimal chat agent used to verify an Agent Manager deployment end to end.
+paths:
+  /chat:
+    post:
+      summary: Send a chat message
+      operationId: chat
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message]
+              properties:
+                message:
+                  type: string
+                  description: The user's message.
+                  example: Hello! Which model are you and where are you running?
+                session_id:
+                  type: string
+                  description: Conversation key; reuse it to continue a conversation.
+                  default: default
+      responses:
+        "200":
+          description: The assistant's reply
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reply:
+                    type: string
+                  session_id:
+                    type: string
+                  model:
+                    type: string
+        "500":
+          description: Model call failed (most often a missing or invalid ANTHROPIC_API_KEY)
+  /chat/{session_id}:
+    delete:
+      summary: Clear a conversation's history
+      operationId: resetSession
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Cleared
+  /healthz:
+    get:
+      summary: Liveness probe
+      operationId: healthz
+      responses:
+        "200":
+          description: Service is up
