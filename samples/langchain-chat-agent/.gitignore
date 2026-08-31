@@ -1,5 +1,15 @@
+# Python bytecode
 __pycache__/
 *.py[cod]
+
+# Virtualenvs
 .venv/
 venv/
+
+# Build artefacts — `pip install .` against pyproject.toml creates these
+*.egg-info
+build/
+dist/
+
+# Local secrets
 .env

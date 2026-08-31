@@ -1,5 +1,0 @@
-fastapi>=0.115
-uvicorn[standard]>=0.34
-pydantic>=2.9
-langchain-anthropic>=0.3
-langchain-core>=0.3

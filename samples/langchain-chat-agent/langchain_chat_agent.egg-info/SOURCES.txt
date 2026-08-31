@@ -1,8 +1,0 @@
-README.md
-main.py
-pyproject.toml
-langchain_chat_agent.egg-info/PKG-INFO
-langchain_chat_agent.egg-info/SOURCES.txt
-langchain_chat_agent.egg-info/dependency_links.txt
-langchain_chat_agent.egg-info/requires.txt
-langchain_chat_agent.egg-info/top_level.txt
