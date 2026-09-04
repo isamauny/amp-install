@@ -48,22 +48,6 @@ The script mirrors the official instructions at https://wso2.github.io/agent-man
 >
 > **The OpenChoreo planes are installed at 1.2.1, not the 1.2.0 the RC3 guide pins.** 1.2.1 is the version the OpenChoreo k3d single-cluster quick-start runs, i.e. an exercised pairing, and every value this script sets was checked against it. The floor is 1.2.0 regardless: the platform-resources extension creates `ProjectType` and `ProjectReleaseBinding` resources, and those CRDs do not exist before OpenChoreo **1.2.0**.
 
-> [!IMPORTANT]
->
-> **The tracing module is installed at 0.6.0.** RC3 now pins 0.6.0 too; this script got there first, while RC2 still pinned 0.4.1. At 0.4.1 the tracing adapter and the observer disagree on the shape of a span's `attributes` — the adapter returns an array, the observer unmarshals into a map — so every span-details lookup fails with `json: cannot unmarshal array into Go struct field TraceSpanDetailsResponse.attributes`.
->
-> The symptom is badly misleading. **Ingest is unaffected**: spans reach OpenSearch correctly attributed to their component, project and environment. But `amp-observer` fetches each trace's root span, gets a 500, skips the trace, and returns **HTTP 200 with an empty list** — so the console shows "no traces" with no error anywhere, which reads exactly like a publishing failure and sends you off to check the gateway, the API key and the collector, all of which are fine.
->
-> If you ever hit this, confirm which half is broken before debugging the agent — count the documents directly rather than trusting the console:
->
-> ```shell
-> kubectl exec -n openchoreo-observability-plane opensearch-master-0 -c opensearch -- \
->   curl -sk -u "admin:$PW" "https://localhost:9200/_cat/indices/otel-traces-*?v"
-> ```
->
-> (OpenSearch listens on **HTTPS**; plain `http://` returns `curl: (52) Empty reply from server`.) If documents are there, the problem is the read path — check `kubectl logs -n openchoreo-observability-plane deploy/observer`.
->
-> The **logs** module is a separate module and is not implicated. It tracks RC3's pin, 0.5.3, raised from RC2's 0.4.1.
 ### Profiles
 
 > [!IMPORTANT]
@@ -80,17 +64,17 @@ The script mirrors the official instructions at https://wso2.github.io/agent-man
 
 The script has two profiles, selected with the `PROFILE` environment variable. They cannot be mixed on one cluster: Thunder's issuer and the API gateway's registered vhost are written once at first install and are never reconciled afterwards, so switching means discarding Thunder's data (and, with it, Agent Manager's tenant data).
 
-| | `PROFILE=local` (default) | `PROFILE=cloud` *(untested)* |
-|---|---|---|
-| Target | Rancher Desktop / k3s | Any cluster with real DNS (EKS, GKE, AKS, DigitalOcean…) |
-| Base domain | `amp.test` | `amp.apis.coach` |
-| Scheme | HTTPS (self-signed CA) | HTTPS |
-| Control-plane gateway | 8080 / 443 | 80 / 443 |
-| Data-plane gateway | 19080 / 19443 | 80 / 443 |
-| Observability gateway | 11080 / 11085 | 80 / 443 |
-| DNS | `/etc/hosts` + a CoreDNS rewrite | published DNS records |
-| Works offline | **yes** | no |
-| Registry | CNCF Distribution, deployed in-cluster | bring your own |
+| | `PROFILE=local` (default) |
+|---|---|
+| Target | Rancher Desktop / k3s |
+| Base domain | `amp.test` |
+| Scheme | HTTPS (self-signed CA) |
+| Control-plane gateway | 8080 / 443 |
+| Data-plane gateway | 19080 / 19443 |
+| Observability gateway | 11080 / 11085 |
+| DNS | `/etc/hosts` + a CoreDNS rewrite |
+| Works offline | **yes** |
+| Registry | CNCF Distribution, deployed in-cluster |
 
 Override the domain with `BASE_DOMAIN=…` if you want something other than the defaults.
 
@@ -166,16 +150,7 @@ The `install` verb is required: running the script with no arguments prints its 
 
 **Check the context line.** Every pre-flight check passes just as happily against a healthy cluster that isn't the one you meant — `kubectl`'s current context is ambient state, possibly set in another terminal hours ago, and this is the only place it is shown. Add `--yes` to skip the prompt; it is required when stdin is not a terminal, so an unattended job cannot silently install into the wrong place.
 
-`local` is the default profile and the only supported one. The cloud invocation, for reference once that profile is verified, would be:
-
-```shell
-# NOT SUPPORTED YET — refuses to run without ALLOW_UNTESTED_CLOUD=1
-ALLOW_UNTESTED_CLOUD=1 PROFILE=cloud TLS_MODE=acme-dns01 \
-  ACME_EMAIL=you@example.com \
-  TLS_ACME_SOLVER_FILE=./solver.yaml \
-  REGISTRY_ENDPOINT=registry.example.com/your-registry \
-  ./scripts/amp-install-rancher.sh install
-```
+`local` is the default profile and the only supported one. 
 
 The script runs in phases — prerequisites, OpenChoreo, then Agent Manager — with validation embedded in each step. Be patient: some steps take several minutes depending on the memory and CPU allotted to the VM, and the observability plane alone can take 25.
 
@@ -236,10 +211,6 @@ Both consoles depend on browser APIs that only exist in a [secure context](https
 | `crypto.subtle` | Thunder console — verifies the ID token's signature | Sign-in redirects in a silent loop. A token *is* issued, its `aud` is correct, and every server-side request returns `200`; the SDK discards the valid token and bounces back to `/authorize`, where the live session re-issues at once |
 | `navigator.clipboard` | AMP console — every copy button | Copy icons do nothing |
 
-The AMP console survives the first one only because it sets `tokenValidation.idToken.validate: false`; it ships the same auth SDK otherwise. Nothing lets it dodge the second.
-
-For the secure context itself, only the scheme matters — the port does not. The data-plane and observability gateways therefore keep the high ports they already had (19443 / 11085). The **control-plane gateway must be on 443**, for an unrelated reason explained in the note below. The wildcard certificates were already in place for the env-Thunder JWKS requirement above; this just puts them in front of everything.
-
 Because they come from the self-signed `openchoreo-ca` chain, **that CA has to be trusted before any of it loads in a browser.** The installer prints this at the end rather than running it for you:
 
 ```shell
@@ -253,44 +224,11 @@ Then quit and reopen the browser completely.
 
 > [!NOTE]
 >
-> **Under HTTPS the control-plane gateway must be on 443. This is not negotiable, and the installer refuses any other port.**
->
-> Upstream equates "TLS" with "port 443" in two places, and only one of them is patchable. `thunder_issuer()` in `thunder-naming.sh` emits `https://<host>` with no port, and `add-environment-thunder.sh` pins `gate_client_port=443` to match — both bash, both `sed`-able. But `agent-manager-service` derives the *same* origin independently in Go (`ThunderOriginFromHandle`, which also emits no port under TLS) and turns it into the RFC 8707 `resource` parameter via `SystemResourceIdentifier` (`<origin>/mcp`). That half is a compiled binary.
->
-> Patching only the bash half — which an earlier revision of this installer did, to run the gateway on 8443 — makes the two disagree. env-Thunder registers its System resource server as `https://<handle>.<base>:8443/mcp`; `amp-api` asks for `https://<handle>.<base>/mcp`; every system-token request returns `400 invalid_target: The resource parameter does not match any registered resource server`. **No agent is ever issued an AgentID.** Nothing surfaces in the UI — agents are created normally, traces stay empty, and the only evidence is a background retry loop in the `amp-api` log. The port also cannot be smuggled through `THUNDER_HOST_BASE_DOMAIN`, because that same value becomes the HTTPRoute hostname, which cannot carry one.
->
-> RC3 *does* add an escape hatch — `PUT /orgs/{org}/environments/{env}/thunder-url` accepts `{"url": "…"}` instead of `{"handle": "…"}`, which would permit an explicit port — but `validateThunderURL` runs it through `ssrf.ValidateURL`, whose deny list includes `10.0.0.0/8`. Any in-cluster hostname resolves to a ClusterIP in that range, so the hatch is unusable on a local cluster.
->
-> **Binding 443 needs no sudo and no Rancher Desktop "Administrative Access."** Its port forwarder binds the *wildcard* address, and Darwin enforces the reserved-port check only when binding a *specific* local address. As an ordinary user, `0.0.0.0:443` binds while `127.0.0.1:443` returns `EACCES`. 443 is the only privileged port the install uses.
-
-### TLS modes
-
-Set with `TLS_MODE`. RC2 requires **wildcard** certificates (`*.<base>` and `*.agents.<base>`), because per-environment Thunder hostnames are created after install with unguessable handles and are reachable only through the wildcard. That rules out HTTP-01 entirely.
-
-- **`selfsigned`** (default) — a cert-manager CA chain rooted at a **self-signed** `openchoreo-ca` (`subject == issuer == CN=openchoreo-ca`, 90-day validity). The leaf certificates themselves are properly issued, with correct wildcard SANs and a real chain — but the trust anchor is private and in no public trust store, so every browser rejects them until you install that root (see above). No DNS credentials needed, works anywhere, including fully offline.
-- **`acme-dns01`** — Let's Encrypt via DNS-01. Deliberately **not** tied to any one provider: supply the solver stanza yourself.
-  ```shell
-  export ACME_EMAIL=you@example.com
-  export TLS_ACME_SOLVER_FILE=./solver.yaml   # the list entries that go under solvers:
-  ```
-  `apis.coach` is hosted on **GoDaddy**, for which cert-manager ships **no built-in solver**. Two routes work:
-  1. *Delegate a subdomain.* Add NS records at GoDaddy delegating `amp.apis.coach` to a provider cert-manager supports natively (Cloudflare, Route53, AzureDNS, Google Cloud DNS, DigitalOcean), then use that provider's solver stanza. This is the shape the RC2 docs themselves recommend.
-  2. *Use acme-dns.* cert-manager has a built-in `acmeDNS` solver. Add a one-time `CNAME _acme-challenge.amp.apis.coach` at GoDaddy pointing at an acme-dns server — no provider API credentials at all.
-
-  **This works on the `local` profile too, but not with the default domain.** Let's Encrypt cannot issue for `amp.test` — `.test` is reserved and has no zone to run a DNS-01 challenge in — so the default local install is self-signed by design. To get publicly-trusted certificates locally, point `BASE_DOMAIN` at a domain you actually control:
-
-  ```shell
-  BASE_DOMAIN=local.example.com TLS_MODE=acme-dns01 \
-    ACME_EMAIL=you@example.com TLS_ACME_SOLVER_FILE=./solver.yaml \
-    ./scripts/amp-install-rancher.sh install
-  ```
-
-  Let's Encrypt then issues for `*.local.example.com` and `*.agents.local.example.com` exactly as it would for the cloud names, which removes the keychain step and every browser warning. Offline operation is unaffected: DNS-01 runs only at issuance and renewal, and resolution still happens through `/etc/hosts` and the CoreDNS rewrite — the certificate is just a file in a Secret. Two things to know: renewal (roughly every 60 days) needs the network and a working DNS-01 challenge, so a long offline stretch will eventually expire them; and the hostnames become public in [Certificate Transparency](https://certificate.transparency.dev/) logs, which the self-signed CA avoids.
-- **`existing`** — use a `ClusterIssuer` you created yourself, named by `TLS_ISSUER_NAME` (default `openchoreo-ca`). The escape hatch for a corporate CA or any solver not modelled here.
+> **Under HTTPS the control-plane gateway must be on 443.**
 
 ### Secret store (OpenBao)
 
-RC2 installs OpenBao with `bao server -dev`, which keeps everything **in memory**. Any interruption of the pod — a laptop sleep, an OOM kill, a VM restart — silently discards every secret written since install.
+RC3 installs OpenBao with `bao server -dev`, which keeps everything **in memory**. Any interruption of the pod — a laptop sleep, an OOM kill, a VM restart — silently discards every secret written since install.
 
 What makes it hard to spot is that the platform appears to recover: dev mode's `postStart` hook re-seeds the platform's *own* placeholder secrets on every start, so the console, Thunder and the gateways all keep working. Only what was written at **runtime** is gone — agent API keys above all. The next agent you create fails with a 500 whose text never mentions OpenBao:
 
@@ -307,11 +245,6 @@ This installer uses [scripts/openbao-values.yaml](scripts/openbao-values.yaml) i
 >
 > For a real deployment, replace the `seal` stanza with a KMS seal (`awskms`, `gcpckms`, `azurekeyvault`, or `transit` against a separate OpenBao) and delete the unsealer sidecar. The storage layout is unchanged, so no data migration is involved.
 
-Two consequences worth knowing:
-
-- **The bootstrap moved into the installer.** RC2 configures Kubernetes auth, policies, roles and seeded secrets from a `postStart` hook. That cannot work outside dev mode — the hook runs while the server is still sealed, so every write in it fails. The installer does the same work after unsealing, where it is idempotent and its failures are visible.
-- **Secrets are seeded write-if-absent, then read back.** Because the store now survives, a re-install must adopt what is already in it rather than overwrite it. Otherwise Thunder gets reconfigured with fresh secrets while every other consumer keeps reading the originals — a mismatch that stays invisible until the first agent build fails at workload-publish with a `401 invalid_client` that never reaches the build log.
-
 Recovering the root token, should you need it:
 
 ```shell
@@ -321,14 +254,6 @@ kubectl get secret openbao-root-token -n openbao -o jsonpath='{.data.root-token}
 > [!WARNING]
 >
 > `scripts/amp-uninstall-rancher.sh` deletes the `openbao` namespace, which destroys both the data volume (`data-openbao-0`) and the unseal key. Agent API keys are not recoverable afterwards.
-
-#### A related RC2 chart gap
-
-The AMP chart's `agentManagerService.config.openbao` block carries `version: v2`, but `workflowPlaneOpenbao` has **no `version` key at all**, so `WORKFLOW_PLANE_OPENBAO_VERSION` is never rendered. The service appears to fall through to an unimplemented branch and synthesise the `status 501` above. There is no chart value to set it through, so the installer applies it directly after install:
-
-```shell
-kubectl set env deployment/amp-api -n wso2-amp WORKFLOW_PLANE_OPENBAO_VERSION=v2
-```
 
 ### Container registry
 
