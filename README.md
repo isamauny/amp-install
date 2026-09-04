@@ -85,7 +85,7 @@ The script has two profiles, selected with the `PROFILE` environment variable. T
 | Target | Rancher Desktop / k3s | Any cluster with real DNS (EKS, GKE, AKS, DigitalOcean…) |
 | Base domain | `amp.test` | `amp.apis.coach` |
 | Scheme | HTTPS (self-signed CA) | HTTPS |
-| Control-plane gateway | 8080 / 8443 | 80 / 443 |
+| Control-plane gateway | 8080 / 443 | 80 / 443 |
 | Data-plane gateway | 19080 / 19443 | 80 / 443 |
 | Observability gateway | 11080 / 11085 | 80 / 443 |
 | DNS | `/etc/hosts` + a CoreDNS rewrite | published DNS records |
@@ -124,7 +124,7 @@ This is why it does not use `nip.io`, which the earlier alpha1 version of this s
 > trusted_issuer.jwks_url must use https (got http://…); http is only allowed for localhost
 > ```
 >
-> That crash-loops the chart's pre-install setup Job until it hits its backoff limit, at which point the Job **deletes its pod** — so `kubectl logs` is empty and the only visible symptom is `failed pre-install: job … BackoffLimitExceeded`. The installer points it at `https://thunder.<base>:8443/oauth2/jwks` and mounts the CA from the `openchoreo-ca-secret` in `cert-manager`.
+> That crash-loops the chart's pre-install setup Job until it hits its backoff limit, at which point the Job **deletes its pod** — so `kubectl logs` is empty and the only visible symptom is `failed pre-install: job … BackoffLimitExceeded`. The installer points it at `https://thunder.<base>/oauth2/jwks` and mounts the CA from the `openchoreo-ca-secret` in `cert-manager`.
 
 Manage the host entries with the helper:
 
@@ -195,13 +195,13 @@ Gateway registration (write-once):
   ✓ vhost: https://default-default.agents.amp.test:19443
 
 Access URLs:
-  Console:      https://console.amp.test:8443
-  API:          https://api-amp.amp.test:8443
-  Thunder:      https://thunder.amp.test:8443
+  Console:      https://console.amp.test
+  API:          https://api-amp.amp.test
+  Thunder:      https://thunder.amp.test
   Observer:     https://traces.amp.test:11085
   Agents:       https://<org>-<project>.agents.amp.test:19443
   OTLP ingest:  https://default-default.agents.amp.test:19443/otel
-  env-Thunder:  https://default-idp.amp.test:8443
+  env-Thunder:  https://default-idp.amp.test
 
 Credentials:
   Console admin:  admin / <generated>
@@ -238,7 +238,7 @@ Both consoles depend on browser APIs that only exist in a [secure context](https
 
 The AMP console survives the first one only because it sets `tokenValidation.idToken.validate: false`; it ships the same auth SDK otherwise. Nothing lets it dodge the second.
 
-**Only the scheme matters — the port does not.** So the `local` profile serves HTTPS on the high ports it already had (8443 / 19443 / 11085) and nothing needs to bind 80 or 443 on your Mac. The wildcard certificates were already in place for the env-Thunder JWKS requirement above; this just puts them in front of everything.
+For the secure context itself, only the scheme matters — the port does not. The data-plane and observability gateways therefore keep the high ports they already had (19443 / 11085). The **control-plane gateway must be on 443**, for an unrelated reason explained in the note below. The wildcard certificates were already in place for the env-Thunder JWKS requirement above; this just puts them in front of everything.
 
 Because they come from the self-signed `openchoreo-ca` chain, **that CA has to be trusted before any of it loads in a browser.** The installer prints this at the end rather than running it for you:
 
@@ -253,9 +253,15 @@ Then quit and reopen the browser completely.
 
 > [!NOTE]
 >
-> **RC2 equates TLS with port 443, so the installer patches two lines.** `thunder_issuer()` in `thunder-naming.sh` emits `https://<host>` with no port, and `add-environment-thunder.sh` pins `gate_client_port=443` to match. Neither is overridable, and the port cannot be smuggled through `THUNDER_HOST_BASE_DOMAIN` because that same value becomes the HTTPRoute hostname, which cannot carry one.
+> **Under HTTPS the control-plane gateway must be on 443. This is not negotiable, and the installer refuses any other port.**
 >
-> So the installer `sed`s both in the copies it downloads to a temp directory (`PATCH_RC2_THUNDER_PORT` in the script). It is pinned to this exact release, and each patch **asserts its target was present** — if upstream rewrites either function the install stops rather than minting an issuer on the wrong port. That assertion matters: the issuer is immutable once minted, so a mistake there costs a full reinstall rather than an upgrade. On `PROFILE=cloud` the gateway really is on 443 and the patch is skipped entirely.
+> Upstream equates "TLS" with "port 443" in two places, and only one of them is patchable. `thunder_issuer()` in `thunder-naming.sh` emits `https://<host>` with no port, and `add-environment-thunder.sh` pins `gate_client_port=443` to match — both bash, both `sed`-able. But `agent-manager-service` derives the *same* origin independently in Go (`ThunderOriginFromHandle`, which also emits no port under TLS) and turns it into the RFC 8707 `resource` parameter via `SystemResourceIdentifier` (`<origin>/mcp`). That half is a compiled binary.
+>
+> Patching only the bash half — which an earlier revision of this installer did, to run the gateway on 8443 — makes the two disagree. env-Thunder registers its System resource server as `https://<handle>.<base>:8443/mcp`; `amp-api` asks for `https://<handle>.<base>/mcp`; every system-token request returns `400 invalid_target: The resource parameter does not match any registered resource server`. **No agent is ever issued an AgentID.** Nothing surfaces in the UI — agents are created normally, traces stay empty, and the only evidence is a background retry loop in the `amp-api` log. The port also cannot be smuggled through `THUNDER_HOST_BASE_DOMAIN`, because that same value becomes the HTTPRoute hostname, which cannot carry one.
+>
+> RC3 *does* add an escape hatch — `PUT /orgs/{org}/environments/{env}/thunder-url` accepts `{"url": "…"}` instead of `{"handle": "…"}`, which would permit an explicit port — but `validateThunderURL` runs it through `ssrf.ValidateURL`, whose deny list includes `10.0.0.0/8`. Any in-cluster hostname resolves to a ClusterIP in that range, so the hatch is unusable on a local cluster.
+>
+> **Binding 443 needs no sudo and no Rancher Desktop "Administrative Access."** Its port forwarder binds the *wildcard* address, and Darwin enforces the reserved-port check only when binding a *specific* local address. As an ordinary user, `0.0.0.0:443` binds while `127.0.0.1:443` returns `EACCES`. 443 is the only privileged port the install uses.
 
 ### TLS modes
 

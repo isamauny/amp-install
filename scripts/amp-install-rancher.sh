@@ -8,10 +8,11 @@
 #
 # Two profiles:
 #   local  Rancher Desktop (k3s) on macOS, fully usable with no Internet
-#          connection after install. HTTPS on high ports (8443/19443/11085)
-#          behind a self-signed CA — the consoles need a secure context, see
-#          the profile block below. Hostnames resolve via /etc/hosts on the Mac
-#          and a coredns-custom rewrite in-cluster.
+#          connection after install. HTTPS behind a self-signed CA — the
+#          consoles need a secure context, and env-Thunder pins the control
+#          plane to 443; the other planes stay on high ports (19443/11085).
+#          See the profile block below. Hostnames resolve via /etc/hosts on
+#          the Mac and a coredns-custom rewrite in-cluster.
 #   cloud  A real cluster with real DNS and TLS (EKS/GKE/AKS/DigitalOcean).
 #          Follows the RC3 main flow.
 #
@@ -198,16 +199,42 @@ case "${PROFILE}" in
     # tokenValidation.idToken.validate=false; it cannot dodge the second.)
     #
     # The PORT is irrelevant to a secure context — only the https scheme is —
-    # so all three planes keep their high ports and nothing has to bind 80/443
-    # on the Mac. values-dp.yaml and values-op.yaml pin the data plane to
-    # 19080/19443 and the observability plane to 11080/11085; the control plane
-    # takes 8080/8443.
+    # but the control plane still has to serve HTTPS on 443, for a reason that
+    # has nothing to do with the browser: env-Thunder.
     #
-    # The one component that does assume TLS means 443 is env-Thunder:
-    # thunder_issuer() in RC2's thunder-naming.sh emits https://<host> with no
-    # port, and add-environment-thunder.sh pins gate_client_port=443 to match.
-    # Neither is overridable, so Step 22 patches both in the copies it
-    # downloads — see PATCH_RC2_THUNDER_PORT there.
+    # agent-manager-service derives each env-Thunder's origin ITSELF, in Go,
+    # from the environment handle and the TLS flag — clients/thundersvc's
+    # ThunderOriginFromHandle():
+    #
+    #   TLS on   ->  https://<handle>.<base>        (no port, i.e. 443)
+    #   TLS off  ->  http://<handle>.<base>:8080    (8080, hardcoded)
+    #
+    # Neither branch takes a port override. SystemResourceIdentifier() then
+    # appends "/mcp" to that origin to form the RFC 8707 `resource` parameter
+    # it sends to env-Thunder, while env-Thunder's own registered System
+    # resource server is written from thunder_issuer() in thunder-naming.sh on
+    # the bash side. Both halves must produce a byte-identical origin.
+    #
+    # Serving 8443 and patching only the bash half — as an earlier revision of
+    # this script did — desynchronises them, and every system-token request
+    # fails with:
+    #   invalid_target: The resource parameter does not match any registered
+    #   resource server
+    # No agent is ever issued an AgentID after that. Agents still get created,
+    # traces never appear, and the only trace of the cause is a background
+    # retry loop in the amp-api log. Serving 443 keeps both halves on
+    # https://<handle>.<base> with no patching anywhere. See the guard in
+    # Step 22, which refuses to run on any other HTTPS port.
+    #
+    # Binding 443 needs neither sudo nor Rancher Desktop's "Administrative
+    # Access": its forwarder binds the WILDCARD address, and Darwin enforces
+    # the reserved-port check only when binding a SPECIFIC local address.
+    # Verified as an ordinary user (uid 501, adminAccess=false):
+    #   0.0.0.0:443 -> binds        127.0.0.1:443 -> EACCES
+    #
+    # 443 is the only privileged port used. values-dp.yaml and values-op.yaml
+    # keep the data plane on 19080/19443 and the observability plane on
+    # 11080/11085; only the control-plane gateway moves.
     #
     # Certificates come from the self-signed openchoreo-ca chain, so that CA
     # must be trusted on this Mac. The summary prints the command.
@@ -230,7 +257,7 @@ case "${PROFILE}" in
     export SCHEME="https"
     export TLS_ENABLED_FLAG="true"
     export CP_GW_HTTP_PORT=8080
-    export CP_GW_HTTPS_PORT=8443
+    export CP_GW_HTTPS_PORT=443
     export DP_GW_HTTP_PORT=19080
     export DP_GW_HTTPS_PORT=19443
     export OBS_GW_HTTP_PORT=11080
@@ -2974,43 +3001,48 @@ if curl -fsSL "${SCRIPTS_BASE_URL}/add-environment-thunder.sh" -o "${ADD_ENV_THU
    && curl -fsSL "${SCRIPTS_BASE_URL}/thunder-naming.sh" -o "${ENV_THUNDER_DIR}/thunder-naming.sh" \
    && curl -fsSL "${SCRIPTS_BASE_URL}/ams-auth.sh" -o "${ENV_THUNDER_DIR}/ams-auth.sh"; then
 
-    # ── PATCH_RC2_THUNDER_PORT ───────────────────────────────────────────────
-    # RC2 equates "TLS" with "port 443". thunder_issuer() in thunder-naming.sh
-    # emits https://<host> with no port, and add-environment-thunder.sh pins
-    # gate_client_port=443 to match it. Neither is overridable by environment
-    # variable, and smuggling the port through THUNDER_HOST_BASE_DOMAIN does not
-    # work — the same value becomes the HTTPRoute hostname, which cannot carry
-    # one. So patch both copies here, in the temp dir we just downloaded them to.
+    # ── THUNDER_PORT_MUST_BE_443 ─────────────────────────────────────────────
+    # Upstream equates "TLS" with "port 443", in BOTH languages, and only one
+    # of them is patchable. thunder_issuer() in thunder-naming.sh emits
+    # https://<host> with no port, and add-environment-thunder.sh pins
+    # gate_client_port=443 to match; those are bash and could be sed'd here.
+    # But agent-manager-service computes the SAME origin independently in Go
+    # (clients/thundersvc's ThunderOriginFromHandle, which likewise emits no
+    # port under TLS) and turns it into the RFC 8707 `resource` parameter via
+    # SystemResourceIdentifier(origin + "/mcp"). That half ships as a compiled
+    # binary.
     #
-    # Safe to do because SCRIPTS_BASE_URL is pinned to this exact release, and
-    # each patch asserts its target was present: if upstream rewrites either
-    # function the install stops here rather than minting an issuer on the wrong
-    # port. That matters more than usual — the issuer is immutable once minted,
-    # so getting it wrong costs a full reinstall, not an upgrade.
+    # An earlier revision of this script did patch the bash half, to run the
+    # control-plane gateway on 8443. env-Thunder then registered its System
+    # resource server as https://<handle>.<base>:8443/mcp while amp-api kept
+    # asking for https://<handle>.<base>/mcp, and every system-token request
+    # returned:
+    #   400 invalid_target: The resource parameter does not match any
+    #       registered resource server
+    # No agent was ever issued an AgentID. Nothing surfaced in the UI — agents
+    # were created normally and only a background retry loop in the amp-api log
+    # showed the cause. Do not reintroduce that patch: making the two halves
+    # agree on any port other than 443 is not possible from here.
+    #
+    # RC3 does expose an escape hatch — PUT /orgs/{org}/environments/{env}/
+    # thunder-url accepts {"url": "..."} instead of {"handle": "..."}, which
+    # would allow an explicit port — but validateThunderURL runs it through
+    # ssrf.ValidateURL, whose deny list includes 10.0.0.0/8. Any in-cluster
+    # hostname resolves to a ClusterIP in that range, so the hatch is unusable
+    # on a local cluster. Worth revisiting if upstream relaxes that check.
+    #
+    # Hence: refuse, rather than mint an issuer that can never work. The issuer
+    # is immutable once minted, so the cost of getting this wrong is a full
+    # reinstall, not an upgrade.
     if [ "${SCHEME}" = "https" ] && [ "${CP_GW_HTTPS_PORT}" != "443" ]; then
-        ENV_THUNDER_NAMING="${ENV_THUNDER_DIR}/thunder-naming.sh"
-
-        if grep -qF "printf 'https://%s' \"\$host\"" "${ENV_THUNDER_NAMING}"; then
-            sed -i.bak \
-                -e "s@printf 'https://%s' \"\$host\"@printf 'https://%s:${CP_GW_HTTPS_PORT}' \"\$host\"@" \
-                "${ENV_THUNDER_NAMING}"
-            success "thunder_issuer() patched to port ${CP_GW_HTTPS_PORT}"
-        else
-            error "thunder-naming.sh no longer contains the expected thunder_issuer() body"
-            error "Refusing to continue: the env-Thunder issuer is immutable once minted."
-            exit 1
-        fi
-
-        if grep -qE '^[[:space:]]*gate_client_port=443[[:space:]]*$' "${ADD_ENV_THUNDER}"; then
-            sed -i.bak \
-                -e "s@^\([[:space:]]*\)gate_client_port=443[[:space:]]*\$@\1gate_client_port=${CP_GW_HTTPS_PORT}@" \
-                "${ADD_ENV_THUNDER}"
-            success "gate_client_port patched to ${CP_GW_HTTPS_PORT}"
-        else
-            error "add-environment-thunder.sh no longer pins gate_client_port=443"
-            error "Refusing to continue: sign-in links would point at the wrong port."
-            exit 1
-        fi
+        error "HTTPS requires CP_GW_HTTPS_PORT=443, but it is ${CP_GW_HTTPS_PORT}."
+        error "env-Thunder's issuer and agent-manager-service's resource indicator are"
+        error "both derived as https://<handle>.${BASE_DOMAIN} with no port, and the"
+        error "second is compiled into the amp-api binary. On any other port they"
+        error "disagree and no agent is ever issued an AgentID."
+        error "Use CP_GW_HTTPS_PORT=443 (binds without sudo — the forwarder uses the"
+        error "wildcard address), or SCHEME=http with CP_GW_HTTP_PORT=8080."
+        exit 1
     fi
 
     # ── PLATFORM_THUNDER_JWKS_URL MUST BE https:// ───────────────────────────
@@ -3188,8 +3220,8 @@ if [ -n "${ENV_THUNDER_ISSUER}" ]; then
     success "env-Thunder issuer read back from provisioning output"
 elif [ "${PROFILE}" = "local" ]; then
     # Local pins the handle, so the issuer is reconstructable. Must match
-    # thunder_issuer() exactly, including the port PATCH_RC2_THUNDER_PORT
-    # injected above; ${CP_PORT} is "" when CP_GW_HTTPS_PORT is 443.
+    # thunder_issuer() exactly — and it does: ${CP_PORT} is "" at 443, which
+    # the guard in Step 22 makes the only HTTPS port that reaches here.
     if [ "${SCHEME}" = "https" ]; then
         ENV_THUNDER_ISSUER="https://default-idp.${BASE_DOMAIN}${CP_PORT}"
     else
