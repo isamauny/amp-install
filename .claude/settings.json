@@ -12,7 +12,10 @@
       "Bash(arp -n 192.168.72.3)",
       "Bash(echo \"=== old nip.io domains in shell history ===\"; grep -ohE \"[a-z.]*[0-9]{1,3}-[0-9]{1,3}-[0-9]{1,3}-[0-9]{1,3}\\\\.nip\\\\.io\" ~/.zsh_history ~/.bash_history 2>/dev/null | sort -u | tail -20; echo \"=== /etc/hosts non-default entries ===\"; grep -vE \"^\\\\s*#|^\\\\s*$\" /etc/hosts 2>/dev/null | head -20)",
       "Read(//Users/isamauny/**)",
-      "Read(//private/etc/**)"
+      "Read(//private/etc/**)",
+      "Bash(kubectl --context rancher-desktop exec -n wso2-amp amp-console-5d787bcc4c-8ht9b -- cat /usr/share/nginx/html/assets/src-DQYYY-Vk.js)",
+      "Bash(helm get *)",
+      "Bash(grep -nE \"^#{1,3} \" rc3-on-your-environment.mdx)"
     ]
   }
 }

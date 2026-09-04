@@ -1,0 +1,145 @@
+# OpenBao — durable, self-unsealing single-node setup.
+#
+# Replaces RC2's deployments/single-cluster/values-openbao.yaml, which runs
+# `bao server -dev`. Dev mode keeps everything in memory, so any interruption of
+# the pod — a laptop sleep, an OOM, a VM restart — silently discards every
+# secret written since install.
+#
+# Dev mode's postStart hook re-seeds the platform's own placeholder secrets on
+# every restart, which is why the platform keeps working while everything
+# written at runtime — agent API keys above all — is gone. The symptom is
+# therefore a credential that WAS working and stops, not a clean failure at
+# install time.
+#
+# NOT the cause of "unexpected error: status 501". An earlier revision of this
+# comment attributed that error here; it is wrong. That 501 comes from
+# openchoreo-api's secrets endpoint when features.secretManagement is off, and
+# reproduces on a perfectly healthy, initialised, unsealed OpenBao. Lost data
+# in dev mode reads back as 404/empty, never 501. See the Control Plane step
+# (Step 8) of amp-install-rancher.sh.
+#
+# ── What this is and is not ─────────────────────────────────────────────────
+# The unseal key is stored in a Kubernetes Secret in this same namespace, and a
+# sidecar uses it to unseal automatically after a restart. That is a DURABILITY
+# fix, not a security one: anyone who can read Secrets in the openbao namespace
+# can unseal this, exactly as with any auto-unseal setup. It is chosen because
+# the alternatives do not fit a laptop — manual unsealing after every restart is
+# unusable, and KMS auto-unseal needs a cloud provider, which breaks the offline
+# requirement. For that reason there is a single unseal key rather than the
+# usual five shares: splitting a key five ways and storing all five shares in
+# one Secret adds ceremony, not safety.
+#
+# For a real deployment, replace the seal stanza below with a KMS seal
+# (`seal "awskms"`, `seal "gcpckms"`, `seal "azurekeyvault"`, or `seal
+# "transit"` against a separate OpenBao) and delete the unsealer sidecar. The
+# storage layout does not change, so no data migration is involved.
+
+injector:
+  enabled: false
+
+server:
+  # dev.enabled defaults to false; standalone.enabled="-" then resolves to true,
+  # which selects the chart's file-storage config below.
+  dev:
+    enabled: false
+
+  standalone:
+    enabled: true
+    config: |
+      ui = true
+
+      listener "tcp" {
+        tls_disable     = 1
+        address         = "[::]:8200"
+        cluster_address = "[::]:8201"
+      }
+
+      # File storage on the PVC declared under dataStorage. This is the whole
+      # point of the file: /openbao/data outlives the pod.
+      storage "file" {
+        path = "/openbao/data"
+      }
+
+  dataStorage:
+    enabled: true
+    size: 2Gi          # the platform stores small KV entries; 10Gi is wasteful on a laptop
+    mountPath: /openbao/data
+    accessMode: ReadWriteOnce
+
+  # Keep the PVC when the StatefulSet is deleted or scaled down, so a
+  # `helm uninstall` of the release alone does not destroy the data. The
+  # uninstall script removes it explicitly when a full teardown is intended.
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+
+  # A sealed server fails the readiness probe by design, so the installer waits
+  # for the pod to be Running (not Ready) before it initialises and unseals.
+  # Left enabled because once unsealed it is the correct readiness signal, and
+  # every dependent step in the installer relies on it.
+  readinessProbe:
+    enabled: true
+
+  # postStart is deliberately EMPTY. RC2 puts the whole bootstrap — Kubernetes
+  # auth, policies, roles, seeded secrets — in a postStart hook, which cannot
+  # work here: at that moment the server is sealed and rejects every write. The
+  # installer performs the same bootstrap after unsealing instead, where it can
+  # also be made idempotent and its failures reported.
+  postStart: []
+
+  # The unseal key, written by the installer after `bao operator init`.
+  # optional: true matters — on a first install this Secret does not exist yet,
+  # and without it the pod would not start at all, leaving nothing to
+  # initialise. The sidecar waits for the file to appear.
+  volumes:
+    - name: unseal
+      secret:
+        secretName: openbao-unseal-key
+        optional: true
+
+  volumeMounts:
+    - name: unseal
+      mountPath: /openbao/unseal
+      readOnly: true
+
+  # Unsealer sidecar: re-unseals after any restart.
+  #
+  # The installer performs the FIRST unseal itself, immediately after init, so a
+  # fresh install never waits on the kubelet to project the newly created
+  # Secret into this volume. This sidecar exists for every restart after that.
+  #
+  # Same image as the server, so it introduces no new pull and works offline.
+  extraContainers:
+    - name: unsealer
+      image: quay.io/openbao/openbao:2.5.1
+      imagePullPolicy: IfNotPresent
+      env:
+        - name: BAO_ADDR
+          value: http://127.0.0.1:8200
+      command:
+        - /bin/sh
+        - -c
+        - |
+          # No `set -e`: this loop must outlive every transient failure —
+          # the server not yet listening, the Secret not yet projected.
+          echo "unsealer: watching"
+          while true; do
+            if [ -r /openbao/unseal/unseal-key ]; then
+              status=$(bao status -format=json 2>/dev/null)
+              case "${status}" in
+                *'"sealed": true'*|*'"sealed":true'*)
+                  echo "unsealer: sealed, unsealing"
+                  bao operator unseal "$(cat /openbao/unseal/unseal-key)" >/dev/null 2>&1 \
+                    && echo "unsealer: unsealed" \
+                    || echo "unsealer: unseal failed, will retry"
+                  ;;
+              esac
+            fi
+            sleep 5
+          done
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+        limits:
+          memory: 64Mi

@@ -27,7 +27,7 @@ SANDBOX_NS="agent-sandbox-system"
 ENV_THUNDER_NS="amp-thunder-default-default"
 # Base domain whose /etc/hosts entries and CoreDNS rewrite the installer added
 # (local profile only). Override to match a non-default install.
-BASE_DOMAIN="${BASE_DOMAIN:-local.apis.coach}"
+BASE_DOMAIN="${BASE_DOMAIN:-amp.test}"
 
 NAMESPACES=(
     "${AMP_NS}" "${THUNDER_NS}" "${ENV_THUNDER_NS}" "${OBSERVABILITY_NS}" "${WORKFLOW_NS}" \
@@ -206,6 +206,18 @@ strip_stuck_finalizers() {
         done < <(kubectl get "${kind}" -n "${ns}" -o name 2>/dev/null | cut -d/ -f2)
     done <<< "${kinds}"
 }
+
+# OpenBao's PVC is declared with persistentVolumeClaimRetentionPolicy Retain, so
+# that removing the release or scaling the StatefulSet does not destroy the
+# secret store. Deleting the namespace below does remove it — state that
+# plainly rather than let it look like the release deletion above was the whole
+# teardown. Everything the platform wrote at runtime, agent API keys included,
+# goes with it, and the unseal key in the same namespace goes too, so the data
+# is not recoverable afterwards even if the volume were kept.
+if kubectl get pvc data-openbao-0 -n "${OPENBAO_NS}" &>/dev/null; then
+    warning "Deleting the ${OPENBAO_NS} namespace destroys the OpenBao data volume"
+    warning "(PVC data-openbao-0) and its unseal key. Agent API keys are not recoverable."
+fi
 
 step "Deleting namespaces"
 kubectl delete namespace "${NAMESPACES[@]}" --ignore-not-found --timeout=120s || true

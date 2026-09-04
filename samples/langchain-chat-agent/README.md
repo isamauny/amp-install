@@ -69,16 +69,24 @@ There is deliberately **no OpenTelemetry setup in this sample.** Agent Manager i
 
 ## Testing it
 
-Once deployed, the invoke URL is `http://<org>-<project>.agents.<base-domain>:<port>`. On a local install add a hosts entry for it first:
+Once deployed, the invoke URL is `https://<org>-<project>.agents.<base-domain>:<port>`. On a local install add a hosts entry for it first:
 
 ```shell
 scripts/amp-hosts.sh add <project>
 ```
 
 ```shell
-curl -s -X POST http://default-<project>.agents.local.apis.coach:19080/chat \
+curl -s -X POST https://default-<project>.agents.amp.test:19443/chat \
   -H 'Content-Type: application/json' \
   -d '{"message":"Hello! Which model are you?"}' | jq
+```
+
+The data-plane certificate is issued by the install's own CA, so add `--cacert` (or `-k` if you are only smoke-testing):
+
+```shell
+kubectl get secret openchoreo-ca-secret -n cert-manager \
+  -o jsonpath='{.data.ca\.crt}' | base64 -d > /tmp/openchoreo-ca.crt
+curl --cacert /tmp/openchoreo-ca.crt -s -X POST https://... 
 ```
 
 Expect:

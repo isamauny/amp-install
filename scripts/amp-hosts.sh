@@ -17,7 +17,7 @@
 # ============================================================================
 set -euo pipefail
 
-BASE_DOMAIN="${BASE_DOMAIN:-local.apis.coach}"
+BASE_DOMAIN="${BASE_DOMAIN:-amp.test}"
 AGENTS_DOMAIN="agents.${BASE_DOMAIN}"
 MARKER_BEGIN="# >>> wso2 agent manager (${BASE_DOMAIN}) >>>"
 MARKER_END="# <<< wso2 agent manager (${BASE_DOMAIN}) <<<"
@@ -34,6 +34,10 @@ build_block() {
         "thunder.${BASE_DOMAIN}" \
         "cp.${BASE_DOMAIN}" \
         "traces.${BASE_DOMAIN}" \
+        `# The env-Thunder handle is pinned to 'default-idp' on the local` \
+        `# profile precisely so this file can be written without querying the` \
+        `# cluster. On the cloud profile agent-manager-service generates an` \
+        `# unguessable handle instead — that profile uses real DNS, not this.` \
         "default-idp.${BASE_DOMAIN}" \
         "default-default.${AGENTS_DOMAIN}"
     # Agent invoke hostnames are <org>-<project>.<agents-domain>. /etc/hosts

@@ -1,15 +1,19 @@
 #!/bin/bash
 # ============================================================================
-# WSO2 Agent Manager v1.0.0-rc2 - Automated Installation Script
+# WSO2 Agent Manager v1.0.0-rc3 - Automated Installation Script
 #
-# Mirrors https://wso2.github.io/agent-manager/docs/v1.0.0-rc2/guides/on-your-environment/
+# Mirrors https://wso2.github.io/agent-manager/docs/v1.0.0-rc3/guides/on-your-environment/
+# (source: documentation/docs/guides/on-your-environment.mdx plus the Phase 2
+#  partial _partials/_amp-installation.mdx, on branch amp-1.0.0-rc3)
 #
 # Two profiles:
 #   local  Rancher Desktop (k3s) on macOS, fully usable with no Internet
-#          connection after install. Plain HTTP; hostnames resolve via
-#          /etc/hosts on the Mac and a coredns-custom rewrite in-cluster.
+#          connection after install. HTTPS on high ports (8443/19443/11085)
+#          behind a self-signed CA — the consoles need a secure context, see
+#          the profile block below. Hostnames resolve via /etc/hosts on the Mac
+#          and a coredns-custom rewrite in-cluster.
 #   cloud  A real cluster with real DNS and TLS (EKS/GKE/AKS/DigitalOcean).
-#          Follows the RC2 main flow.
+#          Follows the RC3 main flow.
 #
 # The two cannot share one deployment: Thunder's issuer and the API gateway's
 # vhost are written once at first install and are never reconciled afterwards,
@@ -19,10 +23,110 @@
 set -euo pipefail
 
 # ============================================================================
+# ARGUMENTS
+# ============================================================================
+# Configuration is by environment variable, not flags — but the script has to
+# answer --help, and it has to reject anything it does not understand. Without
+# this, `./amp-install-rancher.sh --help` silently begins a 40-minute install
+# of a full platform, which is exactly what someone types first.
+usage() {
+    # Delimiter is HELPEOF, not USAGE: "USAGE" is a section heading in the body
+    # below, and bash would end the heredoc there and parse the rest as code.
+    cat <<'HELPEOF'
+amp-install-rancher.sh — install WSO2 Agent Manager v1.0.0-rc3
+
+USAGE
+  ./scripts/amp-install-rancher.sh install       run the install
+  ./scripts/amp-install-rancher.sh install --yes skip the confirmation prompt
+  ./scripts/amp-install-rancher.sh --help        this message
+  ./scripts/amp-install-rancher.sh               this message
+
+  The `install` verb is required: a bare invocation prints this help rather
+  than installing, so nothing starts by accident against the wrong cluster.
+  After pre-flight the installer shows the target context and waits for
+  confirmation; --yes skips that, and is required when stdin is not a terminal.
+
+  Everything else is configured through the environment variables below. The
+  script is idempotent: re-running it after a failure resumes rather than
+  starting over.
+
+PROFILE
+  PROFILE=local                 (default, and the only supported profile)
+                                Rancher Desktop / k3s on macOS. HTTPS on high
+                                ports behind a self-signed CA. Works offline
+                                once installed.
+  PROFILE=cloud                 NOT SUPPORTED — never verified end to end.
+                                Refuses to run without ALLOW_UNTESTED_CLOUD=1.
+
+COMMON
+  BASE_DOMAIN                   default amp.test (local) / amp.apis.coach (cloud)
+  TLS_MODE                      selfsigned (default) | acme-dns01 | existing
+  OPENCHOREO_VERSION            default 1.2.1
+
+TLS (when TLS_MODE is not selfsigned)
+  TLS_ISSUER_NAME               ClusterIssuer name for TLS_MODE=existing
+  TLS_ACME_SOLVER_FILE          DNS-01 solver stanza for TLS_MODE=acme-dns01
+  ACME_EMAIL                    contact address for Let's Encrypt
+
+REGISTRY
+  DEPLOY_REGISTRY               true on local, false on cloud
+  REGISTRY_ENDPOINT             host:port builds push to; required on cloud
+  REGISTRY_HOST / REGISTRY_PORT components of the default endpoint
+  REGISTRY_TLS_VERIFY           false on local, true on cloud
+
+PRE-FLIGHT
+  SKIP_LB_PROBE=1               skip the LoadBalancer provisioning check
+  LB_PROBE_TIMEOUT              default 180s
+
+ESCAPE HATCHES (each disables a guard — read the message it prints first)
+  ALLOW_UNTESTED_CLOUD=1        run the unverified cloud profile
+  ALLOW_SELFSIGNED_CLOUD=1      allow a self-signed CA on the cloud profile
+
+EXAMPLES
+  ./scripts/amp-install-rancher.sh install
+  BASE_DOMAIN=amp.example.com ./scripts/amp-install-rancher.sh install
+  TLS_MODE=acme-dns01 ACME_EMAIL=you@example.com \
+    TLS_ACME_SOLVER_FILE=./solver.yaml ./scripts/amp-install-rancher.sh install
+
+SEE ALSO
+  scripts/amp-hosts.sh              /etc/hosts entries for the local profile
+  scripts/amp-uninstall-rancher.sh  full teardown (destroys OpenBao data)
+  README.md                         profiles, TLS options, known issues
+HELPEOF
+}
+
+# Installing requires the explicit `install` verb. A bare invocation prints the
+# help and exits 0 — it must not begin a 40-minute install of a full platform
+# into whatever cluster the current kubeconfig happens to point at. The verb is
+# the first of two deliberate actions; the second is the confirmation after
+# pre-flight, which is where the target cluster is actually shown.
+ASSUME_YES=0
+ACTION=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --help|-h|help) usage; exit 0 ;;
+        --yes|-y)       ASSUME_YES=1 ;;
+        install)        ACTION="install" ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            echo "" >&2
+            echo "This installer takes no flags beyond --yes — it is configured with" >&2
+            echo "environment variables. Run with --help to see them." >&2
+            exit 1
+            ;;
+    esac
+    shift
+done
+if [ -z "${ACTION}" ]; then
+    usage
+    exit 0
+fi
+
+# ============================================================================
 # CONFIGURATION
 # ============================================================================
 export PROFILE="${PROFILE:-local}"
-export VERSION="1.0.0-rc2"
+export VERSION="1.0.0-rc3"
 export HELM_CHART_REGISTRY="ghcr.io/wso2"
 
 # OpenChoreo plane charts (control / data / workflow / observability).
@@ -78,17 +182,53 @@ export ACME_EMAIL="${ACME_EMAIL:-}"
 case "${PROFILE}" in
   local)
     # ---- Rancher Desktop / k3s, offline-capable -----------------------------
-    # All three plane gateways share one host, so they cannot all own 443.
-    # values-dp.yaml and values-op.yaml pin the data plane to 19080/19443 and
-    # the observability plane to 11080/11085; the control plane takes 8080/8443
-    # rather than 80/443 because add-environment-thunder.sh hardcodes its
-    # non-TLS issuer as http://<handle>.<base>:8080 (see thunder-naming.sh,
-    # thunder_issuer()). Serving the CP gateway there keeps every
-    # add-environment-thunder.sh default correct and avoids having to trust a
-    # self-signed CA in the browser, in env-Thunder's pod, and in every agent.
-    export BASE_DOMAIN="${BASE_DOMAIN:-local.apis.coach}"
-    export SCHEME="http"
-    export TLS_ENABLED_FLAG="false"
+    # HTTPS, on non-standard ports.
+    #
+    # HTTPS is not cosmetic here. Two browser APIs the consoles depend on are
+    # gated to secure contexts and are therefore simply absent over plain HTTP
+    # on a non-localhost origin:
+    #   SubtleCrypto    the Thunder console verifies the ID token's signature
+    #                   with crypto.subtle.verify. Without it a valid token is
+    #                   discarded and sign-in redirects in a silent loop while
+    #                   every server-side request returns 200.
+    #   Clipboard API   navigator.clipboard.writeText backs every copy button
+    #                   in the AMP console. Without it they do nothing.
+    # Both failures are invisible server-side, which makes them expensive to
+    # diagnose. (The AMP console survives the first one only because it sets
+    # tokenValidation.idToken.validate=false; it cannot dodge the second.)
+    #
+    # The PORT is irrelevant to a secure context — only the https scheme is —
+    # so all three planes keep their high ports and nothing has to bind 80/443
+    # on the Mac. values-dp.yaml and values-op.yaml pin the data plane to
+    # 19080/19443 and the observability plane to 11080/11085; the control plane
+    # takes 8080/8443.
+    #
+    # The one component that does assume TLS means 443 is env-Thunder:
+    # thunder_issuer() in RC2's thunder-naming.sh emits https://<host> with no
+    # port, and add-environment-thunder.sh pins gate_client_port=443 to match.
+    # Neither is overridable, so Step 22 patches both in the copies it
+    # downloads — see PATCH_RC2_THUNDER_PORT there.
+    #
+    # Certificates come from the self-signed openchoreo-ca chain, so that CA
+    # must be trusted on this Mac. The summary prints the command.
+    # amp.test, not a domain anyone owns. `.test` is reserved by RFC 2606 and
+    # RFC 6761 and is guaranteed never to be delegated in the global DNS, so it
+    # cannot collide with a real name and nobody has to register anything. This
+    # profile resolves it entirely locally — /etc/hosts on the Mac, a
+    # coredns-custom rewrite in the cluster — so a domain that does not exist in
+    # public DNS costs nothing here.
+    #
+    # The trade-off is certificates: Let's Encrypt cannot issue for .test (there
+    # is no zone to run a DNS-01 challenge in), so this profile is self-signed
+    # only and the CA has to be trusted once per machine. To get publicly
+    # trusted certs locally, override with a domain you actually control:
+    #   BASE_DOMAIN=local.example.com TLS_MODE=acme-dns01 ...
+    #
+    # Avoid .local (mDNS/Bonjour on macOS) and .localhost (macOS does not
+    # resolve multi-label .localhost names at all — see the README).
+    export BASE_DOMAIN="${BASE_DOMAIN:-amp.test}"
+    export SCHEME="https"
+    export TLS_ENABLED_FLAG="true"
     export CP_GW_HTTP_PORT=8080
     export CP_GW_HTTPS_PORT=8443
     export DP_GW_HTTP_PORT=19080
@@ -101,6 +241,40 @@ case "${PROFILE}" in
     ;;
   cloud)
     # ---- Real cluster, real DNS, real TLS ------------------------------------
+    #
+    # NOT YET TESTED — this profile refuses to run.
+    #
+    # Everything below is kept and maintained, but no end-to-end install has
+    # ever completed on a managed cluster, so it is disabled rather than
+    # offered. The gap is not cosmetic: this profile changes the base domain,
+    # all six gateway ports, the TLS issuer, the registry and the secret
+    # generation, and a half-working run reconfigures a cluster in place rather
+    # than failing cleanly. Enable it only against a cluster you can discard.
+    #
+    #   ALLOW_UNTESTED_CLOUD=1 PROFILE=cloud ./amp-install-rancher.sh
+    #
+    # Remove this block once a full run has been verified end to end.
+    if [ "${ALLOW_UNTESTED_CLOUD:-0}" != "1" ]; then
+        echo "" >&2
+        echo "PROFILE=cloud is not supported yet — it has never been verified end to end." >&2
+        echo "" >&2
+        echo "  This installer is currently proven on the 'local' profile only" >&2
+        echo "  (Rancher Desktop / k3s on macOS), which is the default:" >&2
+        echo "" >&2
+        echo "      ./scripts/amp-install-rancher.sh" >&2
+        echo "" >&2
+        echo "  The cloud path is written but untested. It rewrites hostnames, all six" >&2
+        echo "  gateway ports, TLS and the registry, so a partial run leaves a cluster" >&2
+        echo "  in a mixed state rather than stopping cleanly. To try it anyway, on a" >&2
+        echo "  cluster you are willing to throw away:" >&2
+        echo "" >&2
+        echo "      ALLOW_UNTESTED_CLOUD=1 PROFILE=cloud ./scripts/amp-install-rancher.sh" >&2
+        echo "" >&2
+        exit 1
+    fi
+    echo "WARNING: PROFILE=cloud is untested. Proceeding because ALLOW_UNTESTED_CLOUD=1." >&2
+    echo "         Do not run this against a cluster you cannot discard." >&2
+    #
     # Each plane gets its own LoadBalancer address, so every gateway owns the
     # standard ports. RC2 is explicit that the httpPort/httpsPort overrides
     # below are REQUIRED here: values-dp.yaml/values-op.yaml otherwise leave
@@ -135,7 +309,7 @@ export AGENTS_DOMAIN="agents.${BASE_DOMAIN}"
 
 # port_suffix PORT -> ":PORT", or "" when it is the default for ${SCHEME}.
 # Keeps https://console.amp.apis.coach clean while still producing
-# http://console.local.apis.coach:8080 for the local profile.
+# http://console.amp.test:8080 for the local profile.
 port_suffix() {
     local p="$1"
     if { [ "${SCHEME}" = "https" ] && [ "${p}" = "443" ]; } \
@@ -205,21 +379,36 @@ export REGISTRY_NS="${BUILD_CI_NS}"
 export REGISTRY_PORT="${REGISTRY_PORT:-30500}"
 export REGISTRY_HOST="${REGISTRY_HOST:-registry.${BASE_DOMAIN}}"
 export REGISTRY_ENDPOINT="${REGISTRY_ENDPOINT:-${REGISTRY_HOST}:${REGISTRY_PORT}}"
-export REGISTRY_TLS_VERIFY="${REGISTRY_TLS_VERIFY:-false}"
+
+# tlsVerify=false suits the in-cluster evaluation registry (plain HTTP, no auth)
+# and is wrong for anything real, so the cloud profile flips the default. Both
+# stay overridable.
+if [ "${PROFILE}" = "cloud" ]; then
+    export REGISTRY_TLS_VERIFY="${REGISTRY_TLS_VERIFY:-true}"
+else
+    export REGISTRY_TLS_VERIFY="${REGISTRY_TLS_VERIFY:-false}"
+fi
 
 # ---- Platform secrets --------------------------------------------------------
-# RC2 generates real secrets for the platform's internal OAuth clients. That
-# assumes a SEALED OpenBao, which is seeded explicitly. This script installs
-# OpenBao in DEV mode (values-openbao.yaml), which auto-seeds the *placeholder*
-# secrets instead — so on the local profile, generating secrets here would
-# leave Thunder holding generated values while the consumers read placeholders
-# from OpenBao. That mismatch is invisible until the first agent build, which
-# fails at the workload-publish step with a 401 invalid_client that never
-# reaches the build log. Dev-mode OpenBao also loses everything on pod restart,
-# so generated secrets buy nothing locally.
+# RC2 generates real secrets for the platform's internal OAuth clients, which
+# assumes a sealed OpenBao seeded explicitly. Step 5 now runs exactly that (see
+# scripts/openbao-values.yaml), so both profiles seed and then READ BACK from
+# OpenBao — whatever is already stored wins.
 #
-# local: keep the chart placeholders, consistently, on both sides.
-# cloud: generate real secrets and seed them into OpenBao (see Step 5).
+# That read-back is what keeps the two sides consistent. Thunder is configured
+# with these values in Step 7 while every other consumer reads them from
+# OpenBao at runtime, so if a re-install were to generate fresh secrets while
+# OpenBao kept the originals, the mismatch would stay invisible until the first
+# agent build, which fails at workload-publish with a 401 invalid_client that
+# never reaches the build log.
+#
+# local: fixed placeholders. Nothing here is reachable from outside the laptop,
+#        and stable values make a reinstall reproducible and the logs readable.
+# cloud: generated per install.
+#
+# The local profile could now generate real secrets too — the reason it did not
+# (dev-mode OpenBao forgot them on every restart) no longer applies. Left as
+# placeholders deliberately, so this change is about durability alone.
 if [ "${PROFILE}" = "cloud" ]; then
     export AMP_API_CLIENT_SECRET="${AMP_API_CLIENT_SECRET:-$(openssl rand -hex 32)}"
     export AMP_SYSTEM_CLIENT_SECRET="${AMP_SYSTEM_CLIENT_SECRET:-$(openssl rand -hex 32)}"
@@ -230,8 +419,10 @@ if [ "${PROFILE}" = "cloud" ]; then
     export OPENSEARCH_USERNAME="${OPENSEARCH_USERNAME:-admin}"
     export OPENSEARCH_PASSWORD="${OPENSEARCH_PASSWORD:-$(openssl rand -base64 24)}"
 else
-    # The placeholders values-openbao.yaml seeds in dev mode. Passing them
-    # explicitly documents which value each chart is actually using.
+    # The same placeholder values RC2's own values-openbao.yaml uses. Kept
+    # identical so this profile stays comparable with the upstream quick-start;
+    # Step 5 seeds them and reads them back, so these are only the defaults for
+    # a store that does not have them yet.
     export AMP_API_CLIENT_SECRET="amp-api-client-secret"
     export AMP_SYSTEM_CLIENT_SECRET="amp-system-client-secret"
     export AMP_PUBLISHER_CLIENT_SECRET="amp-publisher-client-secret"
@@ -259,6 +450,34 @@ info()    { echo -e "  ℹ $1"; }
 success() { echo -e "  ${GREEN}✓${NC} $1"; }
 warning() { echo -e "  ${YELLOW}⚠${NC} $1"; }
 error()   { echo -e "  ${RED}✗${NC} $1"; ERRORS=$((ERRORS+1)); }
+
+# The DNS records a cloud install has to publish, with the LoadBalancer address
+# each one points at, read live from the three plane gateways.
+#
+# A function rather than inline in the summary because it is needed at THREE
+# points and the summary is the least useful of them: the cloud profile cannot
+# reach the summary until env-Thunder has been provisioned, and that step
+# hard-exits when the hostnames do not resolve. Printing this only at the end
+# meant a first cloud run died telling the operator to publish records it had
+# never shown them the addresses for.
+#
+# Safe to call before the addresses exist — an unprovisioned gateway prints
+# <pending> rather than failing.
+print_dns_records() {
+    echo ""
+    echo -e "${BOLD}DNS records to publish:${NC}"
+    local entry ns rec addr
+    for entry in "openchoreo-control-plane|*.${BASE_DOMAIN}" \
+                 "openchoreo-observability-plane|${OBS_API_PUBLIC_HOST}" \
+                 "openchoreo-data-plane|${AGENTS_DOMAIN} and *.${AGENTS_DOMAIN}"; do
+        ns="${entry%%|*}"; rec="${entry#*|}"
+        addr=$(kubectl get svc gateway-default -n "${ns}" \
+            -o jsonpath='{.status.loadBalancer.ingress[0].ip}{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+        printf '  %-40s -> %s\n' "${rec}" "${addr:-<pending>}"
+    done
+    echo "  The *.${BASE_DOMAIN} wildcard is required, not a convenience: per-environment"
+    echo "  Thunder hostnames are created after install and are reachable only through it."
+}
 
 wait_for() {
     local desc="$1"; shift
@@ -443,9 +662,126 @@ else
     success "Default StorageClass present"
 fi
 
+# LoadBalancer provisioning
+#
+# Every plane gateway is a type=LoadBalancer Service. On a cluster that cannot
+# provision one, the Service sits at <pending> forever and the failure does not
+# surface until "Waiting for Control Plane LoadBalancer IP" — an hour in, with
+# CRDs, cert-manager, OpenBao and Thunder already installed and a teardown
+# needed to retry. RC3's guide recommends this same probe as a prerequisite.
+#
+# Costs ~15s on Rancher Desktop, where k3s ServiceLB answers with the node IP.
+# Set SKIP_LB_PROBE=1 to skip it (e.g. re-running against a cluster already
+# known good, or an air-gapped host that cannot pull nginx).
+if [ "${SKIP_LB_PROBE:-0}" = "1" ]; then
+    warning "Skipping LoadBalancer probe (SKIP_LB_PROBE=1)"
+else
+    info "Verifying LoadBalancer provisioning..."
+    lb_probe_cleanup() {
+        kubectl delete svc lbtest-preflight --ignore-not-found >/dev/null 2>&1 || true
+        kubectl delete deploy lbtest-preflight --ignore-not-found >/dev/null 2>&1 || true
+    }
+    # Clean up first as well as after: a previous interrupted run can leave the
+    # Service behind, and `kubectl wait` would then pass on that stale object.
+    lb_probe_cleanup
+    kubectl create deployment lbtest-preflight --image=nginx >/dev/null 2>&1 || true
+    kubectl expose deployment lbtest-preflight --port=80 --type=LoadBalancer >/dev/null 2>&1 || true
+    if kubectl wait --for=jsonpath='{.status.loadBalancer.ingress}' \
+        svc/lbtest-preflight --timeout="${LB_PROBE_TIMEOUT:-180s}" >/dev/null 2>&1; then
+        LB_PROBE_ADDR=$(kubectl get svc lbtest-preflight \
+            -o jsonpath='{.status.loadBalancer.ingress[0].ip}{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+        lb_probe_cleanup
+        success "LoadBalancer provisioning works (${LB_PROBE_ADDR:-address assigned})"
+    else
+        lb_probe_cleanup
+        echo ""
+        echo -e "${RED}${BOLD}✗ LoadBalancer Services are not being provisioned${NC}"
+        echo ""
+        echo "  A test Service stayed <pending> for ${LB_PROBE_TIMEOUT:-180s}. Every OpenChoreo"
+        echo "  plane gateway needs one, so the install would fail an hour from now"
+        echo "  instead of here."
+        echo ""
+        echo "  On Rancher Desktop: check that the VM is running and that Traefik is"
+        echo "  either disabled or free of ports 80/443 (this script removes it later,"
+        echo "  but ServiceLB must be working now)."
+        echo "  On a cloud cluster: check the LB controller and its IAM permissions."
+        echo ""
+        echo -e "  Re-run with ${BOLD}SKIP_LB_PROBE=1${NC} to bypass this check."
+        echo ""
+        exit 1
+    fi
+fi
+
+# Container registry — cloud must supply one.
+#
+# DEPLOY_REGISTRY is false on this profile, so nothing is installed, yet
+# REGISTRY_ENDPOINT still falls back to registry.${BASE_DOMAIN}:30500 — a host
+# that will not exist and a NodePort that is not published. That value is handed
+# to platform-resources as global.registry.endpoint, so agent builds are
+# configured against it and fail at push, long after the install reports success.
+# Fail here instead, where the fix is one export.
+if [ "${PROFILE}" = "cloud" ] && [ "${DEPLOY_REGISTRY}" != "true" ]; then
+    # "Still the placeholder" is the test: REGISTRY_ENDPOINT is always set by
+    # then, so its value has to be compared against the default it would have
+    # taken, rather than checked for emptiness.
+    if [ "${REGISTRY_ENDPOINT}" = "${REGISTRY_HOST}:${REGISTRY_PORT}" ]; then
+        echo ""
+        echo -e "${RED}${BOLD}✗ The cloud profile needs a container registry${NC}"
+        echo ""
+        echo "  No registry is deployed on this profile, and the default endpoint"
+        echo -e "  (${BOLD}${REGISTRY_ENDPOINT}${NC}) is a local-profile placeholder that will not"
+        echo "  resolve. Agent builds would be configured against it and fail at push,"
+        echo "  after the install has already reported success."
+        echo ""
+        echo -e "  ${BOLD}Point it at a real registry:${NC}"
+        echo -e "    export REGISTRY_ENDPOINT=registry.digitalocean.com/<your-registry>"
+        echo -e "    export REGISTRY_ENDPOINT=<account>.dkr.ecr.<region>.amazonaws.com"
+        echo ""
+        echo "  The builder must already be able to authenticate to it — this"
+        echo "  installer configures no pull/push credentials."
+        echo ""
+        echo -e "  To deploy the in-cluster evaluation registry instead:"
+        echo -e "    ${BOLD}DEPLOY_REGISTRY=true${NC}   (plain HTTP, no auth — not for shared clusters)"
+        echo ""
+        exit 1
+    fi
+fi
+if [ "${PROFILE}" = "cloud" ]; then
+    success "Registry: ${REGISTRY_ENDPOINT} (tlsVerify=${REGISTRY_TLS_VERIFY})"
+fi
+
 # TLS mode sanity — fail before anything is installed, not 20 minutes in.
 case "${TLS_MODE}" in
-    selfsigned) success "TLS mode: self-signed openchoreo-ca chain" ;;
+    selfsigned)
+        # TLS_MODE defaults to selfsigned, which is right for a laptop and wrong
+        # for a real domain: browsers reject every hostname, and the trust-the-CA
+        # instructions in the summary are printed for the local profile only. A
+        # cloud install would therefore come up unreachable with nothing in the
+        # output explaining why. Blocking rather than warning because the
+        # certificate hostnames are baked in at install time.
+        if [ "${PROFILE}" = "cloud" ] && [ "${ALLOW_SELFSIGNED_CLOUD:-0}" != "1" ]; then
+            echo ""
+            echo -e "${RED}${BOLD}✗ TLS_MODE=selfsigned on the cloud profile${NC}"
+            echo ""
+            echo "  Certificates would be issued by a self-signed CA for real public"
+            echo "  hostnames under ${BASE_DOMAIN}, so every browser rejects them and"
+            echo "  the console never loads."
+            echo ""
+            echo -e "  ${BOLD}Use Let's Encrypt:${NC}"
+            echo -e "    export TLS_MODE=acme-dns01"
+            echo -e "    export ACME_EMAIL=you@example.com"
+            echo -e "    export TLS_ACME_SOLVER_FILE=/path/to/solver.yaml"
+            echo ""
+            echo -e "  ${BOLD}Or a CA you already run:${NC}"
+            echo -e "    export TLS_MODE=existing TLS_ISSUER_NAME=<clusterissuer>"
+            echo ""
+            echo -e "  To proceed anyway (internal-only cluster, CA distributed by"
+            echo -e "  other means): ${BOLD}ALLOW_SELFSIGNED_CLOUD=1${NC}"
+            echo ""
+            exit 1
+        fi
+        success "TLS mode: self-signed openchoreo-ca chain"
+        ;;
     existing)
         if ! kubectl get clusterissuer "${TLS_ISSUER_NAME}" &>/dev/null; then
             error "TLS_MODE=existing but ClusterIssuer '${TLS_ISSUER_NAME}' does not exist"
@@ -487,6 +823,57 @@ case "${TLS_MODE}" in
         exit 1
         ;;
 esac
+
+# ============================================================================
+# CONFIRMATION — last point before anything is written
+# ============================================================================
+# Everything above only reads. The Traefik uninstall immediately below is the
+# first mutation, so this is where the operator gets to see what they are about
+# to change and stop.
+#
+# The value here is the CONTEXT line: every check so far can pass against a
+# perfectly healthy cluster that simply is not the one intended. kubectl's
+# current context is ambient state — set by another terminal, another project,
+# hours ago — and nothing else in the output makes it visible.
+CURRENT_CONTEXT=$(kubectl config current-context 2>/dev/null || echo "<unknown>")
+CURRENT_SERVER=$(kubectl config view --minify \
+    -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || echo "<unknown>")
+
+echo ""
+echo -e "${BOLD}────────────────────────────────────────────────────────────────${NC}"
+echo -e "${BOLD} About to install WSO2 Agent Manager v${VERSION}${NC}"
+echo -e "${BOLD}────────────────────────────────────────────────────────────────${NC}"
+echo -e "  Context:      ${BOLD}${CURRENT_CONTEXT}${NC}"
+echo -e "  Cluster:      ${CURRENT_SERVER}"
+echo -e "  Profile:      ${PROFILE}"
+echo -e "  Base domain:  ${BASE_DOMAIN}"
+echo -e "  TLS mode:     ${TLS_MODE}"
+echo -e "  Namespaces:   wso2-amp, openchoreo-{control,data,workflow,observability}-plane,"
+echo -e "                amp-thunder, openbao, cert-manager, external-secrets"
+echo ""
+echo -e "  Takes roughly 40 minutes and modifies the cluster above."
+if helm status traefik -n kube-system &>/dev/null; then
+    echo -e "  ${YELLOW}Traefik is installed here and will be REMOVED${NC} (it conflicts with kgateway)."
+fi
+echo ""
+
+if [ "${ASSUME_YES}" = "1" ]; then
+    info "Proceeding (--yes)"
+elif [ ! -t 0 ]; then
+    # Piped or run from CI: there is no one to answer, and defaulting to "yes"
+    # is how an unattended job installs into the wrong cluster.
+    error "Not a terminal — cannot ask for confirmation."
+    info "Re-run with --yes to install non-interactively."
+    exit 1
+else
+    printf '  Proceed? [y/N] '
+    CONFIRM=""
+    read -r CONFIRM || true
+    case "${CONFIRM}" in
+        [yY]|[yY][eE][sS]) echo "" ;;
+        *) echo ""; info "Aborted — nothing was changed."; exit 0 ;;
+    esac
+fi
 
 # check for traefik (must be removed)
 # k3s ships Traefik bound to host ports 80/443, which collides with
@@ -685,19 +1072,146 @@ wait_for "kgateway pods" \
 verify_pods openchoreo-control-plane
 
 # ── Step 5: OpenBao ──────────────────────────────────────────────────────────
-step "OpenBao secrets store (v0.25.6)"
+# NOT RC2's values-openbao.yaml. That runs `bao server -dev`, which keeps
+# everything in memory: any interruption of the pod — a laptop sleep, an OOM, a
+# VM restart — silently discards every secret written since install. The
+# platform keeps working afterwards, because the dev-mode postStart hook
+# re-seeds its own placeholder secrets on every start, while everything written
+# at RUNTIME is gone. Agent creation then fails with a 500 whose text never
+# names OpenBao:
+#
+#   failed to store secrets in KV: failed to upsert secret:
+#   failed to check secret existence: unexpected error: status 501
+#
+# See scripts/openbao-values.yaml for the replacement and, importantly, for what
+# its "sealed" actually buys (durability, not secrecy — the unseal key lives in
+# a Secret beside it).
+step "OpenBao secrets store (v0.25.6, persistent)"
+
+OPENBAO_VALUES="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/openbao-values.yaml"
+if [ ! -f "${OPENBAO_VALUES}" ]; then
+    error "Missing ${OPENBAO_VALUES} — it ships alongside this script"
+    exit 1
+fi
+
 if ! check_helm_release openbao openbao; then
     retry_cmd "OpenBao install" 3 15 \
         helm upgrade --install openbao oci://ghcr.io/openbao/charts/openbao \
         --namespace openbao \
         --create-namespace \
         --version 0.25.6 \
-        --values https://raw.githubusercontent.com/wso2/agent-manager/amp/v${VERSION}/deployments/single-cluster/values-openbao.yaml \
+        --values "${OPENBAO_VALUES}" \
         --timeout 180s
 fi
-wait_for "OpenBao pod" \
-    kubectl wait --for=condition=Ready pod -l app.kubernetes.io/name=openbao -n openbao --timeout=120s
+
+# Wait for RUNNING, not Ready. A sealed server fails its readiness probe by
+# design (the probe is `bao status`), so waiting for Ready here would time out
+# before anything has had the chance to unseal it.
+wait_for "OpenBao pod running" \
+    kubectl wait --for=jsonpath='{.status.phase}'=Running pod/openbao-0 -n openbao --timeout=180s
+
+bao_exec() { kubectl exec -n openbao openbao-0 -c openbao -- sh -c "export BAO_ADDR=http://127.0.0.1:8200; $1"; }
+
+# ── Initialise (first install only) ──────────────────────────────────────────
+# `bao status` exits 2 when sealed and 0 when unsealed, so its exit code cannot
+# distinguish "uninitialised" from "sealed" — read the field instead.
+OPENBAO_INITIALIZED=$(bao_exec 'bao status -format=json 2>/dev/null || true' \
+    | tr -d ' \n' | grep -o '"initialized":[a-z]*' | cut -d: -f2 || echo "")
+
+if [ "${OPENBAO_INITIALIZED}" = "false" ]; then
+    info "Initialising OpenBao..."
+    # One key share, threshold one. Splitting the key five ways only to store
+    # all five shares in the same Secret is ceremony, not safety — see the
+    # values file. Captured here and never written to disk on this machine.
+    BAO_INIT_JSON=$(bao_exec 'bao operator init -key-shares=1 -key-threshold=1 -format=json')
+    BAO_UNSEAL_KEY=$(printf '%s' "${BAO_INIT_JSON}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["unseal_keys_b64"][0])')
+    BAO_ROOT_TOKEN=$(printf '%s' "${BAO_INIT_JSON}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["root_token"])')
+
+    if [ -z "${BAO_UNSEAL_KEY}" ] || [ -z "${BAO_ROOT_TOKEN}" ]; then
+        error "OpenBao init returned no keys — refusing to continue"
+        exit 1
+    fi
+
+    # Store BEFORE unsealing: if the script dies between the two, the data is
+    # still recoverable. The reverse order would strand a sealed store whose
+    # key exists only in a dead shell's memory, and the only fix would be to
+    # delete the PVC and start over.
+    kubectl create secret generic openbao-unseal-key -n openbao \
+        --from-literal=unseal-key="${BAO_UNSEAL_KEY}" \
+        --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+    kubectl create secret generic openbao-root-token -n openbao \
+        --from-literal=root-token="${BAO_ROOT_TOKEN}" \
+        --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+    success "OpenBao initialised; unseal key and root token stored as Secrets in namespace openbao"
+
+    # The sidecar would get there on its own once the kubelet projects the
+    # Secret into its volume, but that can take a minute. Unseal directly so
+    # the rest of the install proceeds immediately.
+    bao_exec "bao operator unseal '${BAO_UNSEAL_KEY}'" >/dev/null
+    success "OpenBao unsealed"
+else
+    info "OpenBao already initialised — reusing stored keys"
+    BAO_UNSEAL_KEY=$(kubectl get secret openbao-unseal-key -n openbao \
+        -o jsonpath='{.data.unseal-key}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+    if [ -z "${BAO_UNSEAL_KEY}" ]; then
+        error "OpenBao is initialised but Secret openbao-unseal-key is missing."
+        error "Nothing can unseal it. Recover the key, or delete the release, the"
+        error "PVC (data-openbao-0) and the namespace to start over."
+        exit 1
+    fi
+    bao_exec "bao operator unseal '${BAO_UNSEAL_KEY}'" >/dev/null 2>&1 || true
+fi
+
+BAO_ROOT_TOKEN=$(kubectl get secret openbao-root-token -n openbao \
+    -o jsonpath='{.data.root-token}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+if [ -z "${BAO_ROOT_TOKEN}" ]; then
+    error "Secret openbao-root-token is missing — cannot configure OpenBao"
+    exit 1
+fi
+export BAO_ROOT_TOKEN
+
+wait_for "OpenBao pod ready" \
+    kubectl wait --for=condition=Ready pod/openbao-0 -n openbao --timeout=180s
 verify_pods openbao
+
+# ── Bootstrap ────────────────────────────────────────────────────────────────
+# The Kubernetes auth method, policies and roles RC2 configures from its
+# postStart hook. That hook cannot be used outside dev mode: it runs while the
+# server is still sealed, so every write in it fails. Doing it here also makes
+# the failures visible instead of buried in a lifecycle hook.
+#
+# Every command is idempotent, so this re-runs safely on an existing store.
+info "Configuring OpenBao auth, policies and roles..."
+bao_exec "
+set -e
+export BAO_TOKEN='${BAO_ROOT_TOKEN}'
+
+bao secrets enable -path=secret -version=2 kv 2>/dev/null || true
+bao auth enable kubernetes 2>/dev/null || true
+bao write auth/kubernetes/config \
+  kubernetes_host=\"https://\${KUBERNETES_PORT_443_TCP_ADDR}:443\"
+
+bao policy write openchoreo-secret-reader-policy - <<'POLICY'
+path \"secret/data/*\" { capabilities = [\"read\"] }
+path \"secret/metadata/*\" { capabilities = [\"list\", \"read\"] }
+POLICY
+
+bao policy write openchoreo-secret-writer-policy - <<'POLICY'
+path \"secret/data/*\" { capabilities = [\"create\", \"read\", \"update\", \"delete\"] }
+path \"secret/metadata/*\" { capabilities = [\"create\", \"read\", \"update\", \"delete\", \"list\"] }
+POLICY
+
+bao write auth/kubernetes/role/openchoreo-secret-reader-role \
+  bound_service_account_names=default \
+  bound_service_account_namespaces='dp*' \
+  policies=openchoreo-secret-reader-policy ttl=20m
+
+bao write auth/kubernetes/role/openchoreo-secret-writer-role \
+  bound_service_account_names='*' \
+  bound_service_account_namespaces='openbao,openchoreo-workflow-plane,wso2-amp' \
+  policies=openchoreo-secret-writer-policy ttl=20m
+" >/dev/null
+success "OpenBao auth, policies and roles configured"
 
 info "Configuring External Secrets ClusterSecretStore..."
 kubectl apply -f - <<'EOF'
@@ -727,37 +1241,56 @@ spec:
 EOF
 success "ClusterSecretStore configured"
 
-# Dev-mode OpenBao seeds placeholder secrets automatically; the local profile
-# uses those as-is (see the CONFIGURATION block for why). The cloud profile
-# generated real ones, so overwrite the seeded placeholders with them — every
-# consumer reads these from OpenBao at runtime, and Thunder is given the same
-# values in Step 7, so the two sides have to be written together.
-if [ "${PROFILE}" = "cloud" ]; then
-    info "Seeding generated platform secrets into OpenBao..."
-    kubectl exec -n openbao openbao-0 -- sh -c "
-export BAO_ADDR=http://127.0.0.1:8200
-bao kv put secret/workflow-plane-oauth-client-secret value='${WORKFLOW_PUBLISHER_SECRET}'
-bao kv put secret/amp-publisher-client-secret value='${AMP_PUBLISHER_CLIENT_SECRET}'
-bao kv put secret/amp-system-client-secret value='${AMP_SYSTEM_CLIENT_SECRET}'
-bao kv put secret/observer-oauth-client-secret value='${OBSERVER_READER_SECRET}'
-bao kv put secret/opensearch-username value='${OPENSEARCH_USERNAME}'
-bao kv put secret/opensearch-password value='${OPENSEARCH_PASSWORD}'
-" >/dev/null
-    success "Platform secrets seeded into OpenBao"
-else
-    # Read back the placeholder OpenSearch password dev mode seeded, so the
-    # logs module below is given the value OpenSearch is actually bootstrapped
-    # with rather than a second, conflicting one.
-    OPENSEARCH_PASSWORD=$(kubectl exec -n openbao openbao-0 -- sh -c \
-        "export BAO_ADDR=http://127.0.0.1:8200; bao kv get -field=value secret/opensearch-password" \
-        2>/dev/null || echo "")
-    export OPENSEARCH_PASSWORD
-    if [ -n "${OPENSEARCH_PASSWORD}" ]; then
-        success "Read seeded OpenSearch password from OpenBao"
+# Seed the platform's own secrets.
+#
+# RC2 does this from the dev-mode postStart hook, which re-ran on every pod
+# start. Nothing re-runs it now, so the installer owns it — and because the
+# store is persistent, a re-run must NOT clobber values the platform is already
+# using. Hence write-if-absent on the local profile: the values are fixed
+# placeholders, so re-writing them is harmless, but keeping the read path
+# identical on both profiles means one code path to reason about.
+#
+# ${OPENSEARCH_PASSWORD} is empty on the local profile at this point and is
+# read back below, so the logs module is given the value OpenSearch is actually
+# bootstrapped with rather than a second, conflicting one.
+info "Seeding platform secrets into OpenBao..."
+bao_seed() {
+    # Only writes when the key is absent, so re-running the installer against a
+    # live store never rotates a secret out from under a running component.
+    bao_exec "export BAO_TOKEN='${BAO_ROOT_TOKEN}'
+bao kv get -field=value secret/$1 >/dev/null 2>&1 || bao kv put secret/$1 value='$2' >/dev/null"
+}
+bao_seed workflow-plane-oauth-client-secret "${WORKFLOW_PUBLISHER_SECRET}"
+bao_seed amp-publisher-client-secret        "${AMP_PUBLISHER_CLIENT_SECRET}"
+bao_seed amp-system-client-secret           "${AMP_SYSTEM_CLIENT_SECRET}"
+bao_seed observer-oauth-client-secret       "${OBSERVER_READER_SECRET}"
+bao_seed opensearch-username                "${OPENSEARCH_USERNAME}"
+bao_seed opensearch-password                "${OPENSEARCH_PASSWORD:-ThisIsTheOpenSearchPassword1}"
+success "Platform secrets seeded into OpenBao"
+
+# Read every value back, on BOTH profiles. Previously only the local profile
+# did this; now that the store survives restarts, a re-install against an
+# existing OpenBao must adopt the values already in it rather than the ones it
+# just generated in memory — otherwise Thunder is reconfigured in Step 7 with
+# fresh secrets while the consumers keep reading the originals, which surfaces
+# much later as a 401 invalid_client at workload publish.
+bao_read() { bao_exec "export BAO_TOKEN='${BAO_ROOT_TOKEN}'; bao kv get -field=value secret/$1" 2>/dev/null || echo ""; }
+for pair in \
+    "WORKFLOW_PUBLISHER_SECRET:workflow-plane-oauth-client-secret" \
+    "AMP_PUBLISHER_CLIENT_SECRET:amp-publisher-client-secret" \
+    "AMP_SYSTEM_CLIENT_SECRET:amp-system-client-secret" \
+    "OBSERVER_READER_SECRET:observer-oauth-client-secret" \
+    "OPENSEARCH_USERNAME:opensearch-username" \
+    "OPENSEARCH_PASSWORD:opensearch-password"; do
+    var="${pair%%:*}"; key="${pair#*:}"
+    val="$(bao_read "${key}")"
+    if [ -n "${val}" ]; then
+        export "${var}=${val}"
     else
-        warning "Could not read secret/opensearch-password from OpenBao — logs module will use chart defaults"
+        warning "Could not read secret/${key} from OpenBao — using the in-memory value"
     fi
-fi
+done
+success "Platform secrets read back from OpenBao"
 
 # ── Step 6: TLS Setup ────────────────────────────────────────────────────────
 # Every Certificate below refers to a ClusterIssuer named ${TLS_ISSUER_NAME}
@@ -862,8 +1395,9 @@ if ! check_helm_release amp-thunder-extension "${THUNDER_NS}"; then
     # are also seeded into OpenBao, but seeding OpenBao only tells the
     # consumer; Thunder still registers the default unless it is told
     # otherwise, and the consumer then presents a secret Thunder does not
-    # have. On the local profile these are the placeholders, matching what
-    # dev-mode OpenBao seeded.
+    # have. These are the values Step 5 read back out of OpenBao, so both
+    # sides are given the same secret even on a re-install against a store
+    # that already had one.
     helm install amp-thunder-extension \
         oci://${HELM_CHART_REGISTRY}/wso2-amp-thunder-extension \
         --version ${VERSION} \
@@ -989,6 +1523,19 @@ if ! check_helm_release openchoreo-control-plane openchoreo-control-plane; then
         --create-namespace \
         --set gateway.httpPort="${CP_GW_HTTP_PORT}" \
         --set gateway.httpsPort="${CP_GW_HTTPS_PORT}" \
+        `# Agent Manager stores plane-scoped secrets THROUGH openchoreo-api's` \
+        `# /api/v1alpha1/namespaces/{ns}/secrets endpoint, not by talking to` \
+        `# OpenBao itself. That endpoint is behind this feature flag and the` \
+        `# chart defaults it OFF, so it answers 501 Not Implemented and AMP` \
+        `# reports the 501 verbatim, naming its own KV layer and never` \
+        `# openchoreo-api:` \
+        `#   failed to upsert secret: failed to check secret existence:` \
+        `#   unexpected error: status 501` \
+        `# Everything that stores a secret this way fails the same way —` \
+        `# monitor creation (publisher + scheduler credentials) above all.` \
+        `# The later control-plane upgrades all use --reuse-values, so setting` \
+        `# it here carries through.` \
+        --set features.secretManagement.enabled=true \
         --values "${CP_PLACEHOLDER_VALUES}"
 fi
 rm -f "${CP_PLACEHOLDER_VALUES}"
@@ -1311,6 +1858,26 @@ if ! check_helm_release openchoreo-workflow-plane openchoreo-workflow-plane; the
         --namespace openchoreo-workflow-plane \
         --create-namespace \
         --set clusterAgent.tls.generateCerts=true \
+        `# The chart caps the Argo controller at cpu=50m/memory=64Mi, which is` \
+        `# far too small for its 32 workflow workers and ~10 informers. The` \
+        `# controller pins itself against both ceilings (measured: 47m/50m,` \
+        `# 63Mi/64Mi), every API call queues for 20-40s ("Waited for K8S` \
+        `# request"), and informer sync alone outlasts the liveness probe.` \
+        `#` \
+        `# It then self-destructs: Argo's /healthz returns 500 for any` \
+        `# incomplete workflow older than HEALTHZ_AGE (default 5m), so a` \
+        `# workflow the throttled controller cannot reach keeps the probe red` \
+        `# and the probe keeps killing the controller. Observed at 97 restarts` \
+        `# with two monitor workflows stuck at no status whatsoever.` \
+        `#` \
+        `# Nothing about this names CPU: agent builds and monitor analyses just` \
+        `# sit "pending" forever while every pod reads Running or CrashLoopBackOff.` \
+        `# Verified: with the limits below the same two workflows reconciled and` \
+        `# succeeded in 11 seconds, and the controller idles at 1m CPU / 49Mi.` \
+        --set argo-workflows.controller.resources.limits.cpu=500m \
+        --set argo-workflows.controller.resources.limits.memory=256Mi \
+        --set argo-workflows.controller.resources.requests.cpu=100m \
+        --set argo-workflows.controller.resources.requests.memory=128Mi \
         --timeout 600s
 fi
 wait_for "Workflow Plane deployments" \
@@ -1507,7 +2074,7 @@ fi
 helm upgrade --install observability-logs-opensearch \
     oci://ghcr.io/openchoreo/helm-charts/observability-logs-opensearch \
     --create-namespace --namespace openchoreo-observability-plane \
-    --version 0.4.1 \
+    --version 0.5.3 \
     --set openSearchSetup.openSearchSecretName="opensearch-admin-credentials" \
     --set adapter.openSearchSecretName="opensearch-admin-credentials" \
     ${OS_PW_ARGS[@]+"${OS_PW_ARGS[@]}"} \
@@ -1515,18 +2082,60 @@ helm upgrade --install observability-logs-opensearch \
 
 helm upgrade observability-logs-opensearch \
     oci://ghcr.io/openchoreo/helm-charts/observability-logs-opensearch \
-    --namespace openchoreo-observability-plane --version 0.4.1 \
+    --namespace openchoreo-observability-plane --version 0.5.3 \
     --reuse-values --set fluent-bit.enabled=true --timeout 10m
 
+# Same chart-default resource squeeze as the Argo controller (see the Workflow
+# Plane step): prometheus-operator ships cpu=40m/memory=60Mi, and its liveness
+# probe allows a 1-SECOND timeout on an HTTPS /healthz. A throttled operator
+# cannot answer that in time, so the kubelet kills it — observed at 563
+# restarts over three days, never once reaching Ready.
+#
+# The logs are actively misleading: the operator reports "received SIGTERM,
+# exiting gracefully" followed by a wall of "client rate limiter Wait returned
+# an error: context canceled" and a rejected ServiceMonitor, all of which are
+# consequences of the kill, not causes. The give-away is in the pod events, not
+# the logs: "Liveness probe failed: context deadline exceeded".
+#
+# Verified: with the limits below it reached Ready and stayed there.
 helm upgrade --install observability-metrics-prometheus \
     oci://ghcr.io/openchoreo/helm-charts/observability-metrics-prometheus \
     --create-namespace --namespace openchoreo-observability-plane \
+    --set kube-prometheus-stack.prometheusOperator.resources.limits.cpu=300m \
+    --set kube-prometheus-stack.prometheusOperator.resources.limits.memory=256Mi \
+    --set kube-prometheus-stack.prometheusOperator.resources.requests.cpu=50m \
+    --set kube-prometheus-stack.prometheusOperator.resources.requests.memory=128Mi \
     --version 0.6.1 --timeout 10m
 
+# 0.6.0, which RC3 now pins too — this script got here first, ahead of the
+# guide, for the reason below. RC2 pinned 0.4.1. The 0.4.1 tracing adapter and
+# the observer disagree on the shape of a span's `attributes`: the adapter
+# returns an array, the observer unmarshals into a map, and every span details
+# lookup fails with
+#
+#   json: cannot unmarshal array into Go struct field
+#   TraceSpanDetailsResponse.attributes of type map[string]interface {}
+#
+# The damage is entirely on the READ path and is close to invisible. Ingest is
+# unaffected — spans reach OpenSearch correctly attributed — but amp-observer
+# fetches each trace's root span, gets a 500, skips the trace, and returns
+# HTTP 200 with an empty list. The console shows "no traces" with no error
+# anywhere, which reads exactly like a publishing failure and sends you to the
+# gateway, the API key and the collector, all of which are fine.
+#
+# 0.6.0 fixes it. Verified on a live cluster: amp-observer went from
+# "totalCount:0, returned:0" to "totalCount:4, returned:4" against unchanged
+# data already in the index, with no errors in the observer log. The chart's
+# value keys are unchanged between 0.4.1 and 0.6.0 (0.6.0 only adds
+# global.imageRegistry and imagePullSecrets), so the three --set values below
+# carry over as-is.
+#
+# The logs module above is a separate module and is not implicated in this. It
+# tracks RC3's pin (0.5.3), raised from RC2's 0.4.1.
 helm upgrade --install observability-traces-opensearch \
     oci://ghcr.io/openchoreo/helm-charts/observability-tracing-opensearch \
     --create-namespace --namespace openchoreo-observability-plane \
-    --version 0.4.1 \
+    --version 0.6.0 \
     --set openSearch.enabled=false \
     --set openSearchSetup.openSearchSecretName="opensearch-admin-credentials" \
     --set opentelemetry-collector.configMap.existingName="amp-opentelemetry-collector-config" \
@@ -1537,6 +2146,21 @@ success "Observability modules installed"
 OBS_LB_IP=$(kubectl get svc gateway-default -n openchoreo-observability-plane \
     -o jsonpath='{.status.loadBalancer.ingress[0].ip}{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
 info "Observability gateway: ${OBS_LB_IP:-<pending>} — ${OBS_API_PUBLIC_URL}"
+
+# All three plane gateways now have their LoadBalancer addresses, so this is the
+# earliest point a cloud operator can publish DNS — and they have to, because
+# env-Thunder (later) refuses to run until the hostnames resolve. Printed here
+# rather than only in the summary, which a first cloud run never reaches.
+#
+# Not a blocking prompt: DNS propagation is not something to hold a shell open
+# for, and re-running the installer is the supported way to continue.
+if [ "${PROFILE}" = "cloud" ]; then
+    print_dns_records
+    echo ""
+    warning "Publish these now if you have not already."
+    warning "env-Thunder provisioning below requires ${THUNDER_PUBLIC_HOST} to resolve"
+    warning "and will stop the install if it does not. Re-run afterwards — it is idempotent."
+fi
 
 # Registered as ClusterObservabilityPlane, matching both the RC2 docs and the
 # two `kubectl patch` calls below that reference it by that kind. (The alpha1
@@ -1771,7 +2395,7 @@ EOF
         -n "${REGISTRY_NS}" --timeout=300s
 
     # (a) Make the endpoint resolve on the NODE. Pods do not use this entry —
-    # they resolve the same name through the coredns-custom rewrite from Step 2,
+    # they resolve the same name through the coredns-custom rewrite from Step 0,
     # which points at the Service.
     REGISTRY_NODE_DNS_OK="false"
     if command -v rdctl &>/dev/null; then
@@ -1872,8 +2496,16 @@ if ! check_helm_release amp "${AMP_NS}"; then
         --set agentManagerService.config.openChoreo.baseURL="${OPENCHOREO_API_URL}" \
         --set agentManagerService.config.tlsEnabled="${TLS_ENABLED_FLAG}" \
         --set-string console.config.tlsEnabled="${TLS_ENABLED_FLAG}" \
+        `# Both chart defaults are the dev-mode root token "root", which does` \
+        `# not exist once OpenBao is initialised for real. Without these the` \
+        `# platform installs clean and then cannot store a single secret.` \
+        --set-string agentManagerService.config.openbao.token="${BAO_ROOT_TOKEN}" \
+        --set-string agentManagerService.config.workflowPlaneOpenbao.token="${BAO_ROOT_TOKEN}" \
         --timeout 1800s
 fi
+
+# NOTE: WORKFLOW_PLANE_OPENBAO_VERSION also has to be set on amp-api, but it is
+# applied at the END of Step 21 rather than here. See the comment there.
 
 wait_for "PostgreSQL" \
     kubectl wait --for=jsonpath='{.status.readyReplicas}'=1 \
@@ -2220,9 +2852,17 @@ retry_cmd "Default environment gateway endpoints" 3 15 \
 # agents are published on am-gateway.localhost: the console shows an empty
 # invoke URL and try-out returns 405 against its own host.
 #
-# The thunderHostBaseDomain pair is what makes the API and Console agree that
-# an environment's identity URL is <handle>.${BASE_DOMAIN} rather than the
+# The idpHostBaseDomain pair is what makes the API and Console agree that an
+# environment's identity URL is <handle>.${BASE_DOMAIN} rather than the
 # amp.localhost default.
+#
+# RENAMED IN RC3: this was thunderHostBaseDomain through RC2. The chart carries
+# a values schema, so the old name is a hard failure, not a silently ignored
+# key — "additional properties 'thunderHostBaseDomain' not allowed". Note the
+# rename is confined to the Helm values: add-environment-thunder.sh still reads
+# the environment variable THUNDER_HOST_BASE_DOMAIN (checked against the rc3
+# copy of that script), so the export further down is NOT the same name and
+# must not be changed with it.
 #
 # gatewayBaseDomain is what add-environment.sh prefixes "<env>-<org>." onto,
 # so pointing it at ${AGENTS_DOMAIN} makes an added environment's gateway land
@@ -2246,13 +2886,46 @@ retry_cmd "Agent Manager environment defaults" 3 15 \
     --set agentManagerService.config.gatewayBaseDomain="${AGENTS_DOMAIN}" \
     --set-string agentManagerService.config.gatewayVhostScheme="${SCHEME}" \
     --set-string agentManagerService.config.gatewayVhostPort="$([ "${SCHEME}" = "https" ] && echo "${DP_GW_HTTPS_PORT}" || echo "${DP_GW_HTTP_PORT}")" \
-    --set agentManagerService.config.thunderHostBaseDomain="${BASE_DOMAIN}" \
+    --set agentManagerService.config.idpHostBaseDomain="${BASE_DOMAIN}" \
     --set agentManagerService.config.tlsEnabled="${TLS_ENABLED_FLAG}" \
-    --set console.config.thunderHostBaseDomain="${BASE_DOMAIN}" \
+    --set console.config.idpHostBaseDomain="${BASE_DOMAIN}" \
     --set-string console.config.tlsEnabled="${TLS_ENABLED_FLAG}"
+
+# WORKFLOW_PLANE_OPENBAO_VERSION is not rendered by the RC2 chart: its
+# `openbao` values block carries `version: v2` while `workflowPlaneOpenbao`
+# has no version key at all, so the workflow-plane KV client runs without an
+# explicit version where the platform-plane one gets v2.
+#
+# DO NOT credit this with fixing "unexpected error: status 501" — it does not.
+# That 501 is openchoreo-api's, returned by its secrets endpoint when
+# features.secretManagement is off (see Step 8), and it persisted verbatim
+# with this variable set. Setting it here is precautionary version-pinning
+# only. `strings` on the amp-api binary does not show this name at all, so it
+# may well be read under a different key or not at all; it is kept because it
+# is free and idempotent, not because it is known to do anything.
+#
+# THIS MUST STAY AFTER THE LAST `helm upgrade amp`. There is no chart value to
+# set it through, so it goes on with `kubectl set env` — and every subsequent
+# `helm upgrade` re-renders the pod template from the chart and silently drops
+# it, even with --reuse-values (that flag reuses VALUES, not manual edits to
+# the rendered objects).
+#
+# Applied unconditionally because `kubectl set env` is idempotent — it only
+# triggers a rollout when the value actually changes. The wait below covers
+# that rollout.
+info "Setting WORKFLOW_PLANE_OPENBAO_VERSION (absent from the RC2 chart)..."
+if kubectl set env deployment/amp-api -n "${AMP_NS}" WORKFLOW_PLANE_OPENBAO_VERSION=v2 >/dev/null 2>&1; then
+    success "WORKFLOW_PLANE_OPENBAO_VERSION=v2 set on amp-api"
+else
+    warning "Could not set WORKFLOW_PLANE_OPENBAO_VERSION on amp-api (precautionary only)"
+fi
 
 wait_for "Agent Manager after endpoint wiring" \
     kubectl wait --for=condition=Available deployment/amp-api -n ${AMP_NS} --timeout=300s
+# `kubectl wait ... Available` can pass on the OLD ReplicaSet while the env
+# rollout is still starting, so wait on the rollout itself too.
+wait_for "Agent Manager rollout" \
+    kubectl rollout status deployment/amp-api -n ${AMP_NS} --timeout=300s
 
 # ── Step 22: Provision env-Thunder for the default Environment ───────────────
 # Every Environment needs its own dedicated Thunder instance, separate from the
@@ -2280,7 +2953,11 @@ SCRIPTS_BASE_URL="https://raw.githubusercontent.com/wso2/agent-manager/amp/v${VE
 if [ "${PROFILE}" = "cloud" ]; then
     if ! dig +short "${THUNDER_PUBLIC_HOST}" | grep -q .; then
         error "${THUNDER_PUBLIC_HOST} does not resolve — publish the DNS records before this step"
-        info "Required: *.${BASE_DOMAIN} -> control-plane gateway LB"
+        # Reprint with the live addresses. Exiting here skips the summary, so
+        # without this the operator is told to publish records and never shown
+        # what to point them at.
+        print_dns_records
+        echo ""
         info "Re-run the installer once DNS has propagated; it is idempotent."
         exit 1
     fi
@@ -2296,6 +2973,45 @@ fi
 if curl -fsSL "${SCRIPTS_BASE_URL}/add-environment-thunder.sh" -o "${ADD_ENV_THUNDER}" \
    && curl -fsSL "${SCRIPTS_BASE_URL}/thunder-naming.sh" -o "${ENV_THUNDER_DIR}/thunder-naming.sh" \
    && curl -fsSL "${SCRIPTS_BASE_URL}/ams-auth.sh" -o "${ENV_THUNDER_DIR}/ams-auth.sh"; then
+
+    # ── PATCH_RC2_THUNDER_PORT ───────────────────────────────────────────────
+    # RC2 equates "TLS" with "port 443". thunder_issuer() in thunder-naming.sh
+    # emits https://<host> with no port, and add-environment-thunder.sh pins
+    # gate_client_port=443 to match it. Neither is overridable by environment
+    # variable, and smuggling the port through THUNDER_HOST_BASE_DOMAIN does not
+    # work — the same value becomes the HTTPRoute hostname, which cannot carry
+    # one. So patch both copies here, in the temp dir we just downloaded them to.
+    #
+    # Safe to do because SCRIPTS_BASE_URL is pinned to this exact release, and
+    # each patch asserts its target was present: if upstream rewrites either
+    # function the install stops here rather than minting an issuer on the wrong
+    # port. That matters more than usual — the issuer is immutable once minted,
+    # so getting it wrong costs a full reinstall, not an upgrade.
+    if [ "${SCHEME}" = "https" ] && [ "${CP_GW_HTTPS_PORT}" != "443" ]; then
+        ENV_THUNDER_NAMING="${ENV_THUNDER_DIR}/thunder-naming.sh"
+
+        if grep -qF "printf 'https://%s' \"\$host\"" "${ENV_THUNDER_NAMING}"; then
+            sed -i.bak \
+                -e "s@printf 'https://%s' \"\$host\"@printf 'https://%s:${CP_GW_HTTPS_PORT}' \"\$host\"@" \
+                "${ENV_THUNDER_NAMING}"
+            success "thunder_issuer() patched to port ${CP_GW_HTTPS_PORT}"
+        else
+            error "thunder-naming.sh no longer contains the expected thunder_issuer() body"
+            error "Refusing to continue: the env-Thunder issuer is immutable once minted."
+            exit 1
+        fi
+
+        if grep -qE '^[[:space:]]*gate_client_port=443[[:space:]]*$' "${ADD_ENV_THUNDER}"; then
+            sed -i.bak \
+                -e "s@^\([[:space:]]*\)gate_client_port=443[[:space:]]*\$@\1gate_client_port=${CP_GW_HTTPS_PORT}@" \
+                "${ADD_ENV_THUNDER}"
+            success "gate_client_port patched to ${CP_GW_HTTPS_PORT}"
+        else
+            error "add-environment-thunder.sh no longer pins gate_client_port=443"
+            error "Refusing to continue: sign-in links would point at the wrong port."
+            exit 1
+        fi
+    fi
 
     # ── PLATFORM_THUNDER_JWKS_URL MUST BE https:// ───────────────────────────
     # env-Thunder validates this at config load and refuses anything else:
@@ -2370,6 +3086,33 @@ if curl -fsSL "${SCRIPTS_BASE_URL}/add-environment-thunder.sh" -o "${ADD_ENV_THU
     # later attempt fail with "HTTP 000" — a connection error that masks the
     # real cause. Retrying without re-establishing them turns one legible
     # failure into three misleading ones.
+    # ── THUNDER_HANDLE: pinned locally, server-generated in the cloud ─────────
+    # The handle is the label the per-environment Thunder answers to,
+    # "<handle>.${BASE_DOMAIN}", and RC2 treats it as UNGUESSABLE on purpose
+    # (see thunder_host in thunder-naming.sh and agent-manager-service's
+    # models/env_thunder_url.go): every environment's Thunder is reachable only
+    # through the *.${BASE_DOMAIN} wildcard, so a predictable label is the one
+    # thing standing between a public DNS name and an environment's IdP.
+    #
+    # local: pin 'default-idp'. Nothing is publicly resolvable — the name exists
+    #        only in /etc/hosts and a CoreDNS rewrite — so unguessability buys
+    #        nothing, while a fixed label keeps scripts/amp-hosts.sh able to
+    #        write the entry without first querying the cluster.
+    # cloud: leave it UNSET so agent-manager-service generates a 10-character
+    #        handle. There the host really is published, and pinning it would
+    #        quietly discard the protection the design intends.
+    ENV_THUNDER_HANDLE_ARGS=()
+    if [ "${PROFILE}" = "local" ]; then
+        ENV_THUNDER_HANDLE_ARGS=(THUNDER_HANDLE=default-idp)
+    fi
+
+    # Capture the provisioning output: on the cloud profile the handle is not
+    # knowable in advance, so the issuer has to be READ BACK from the script
+    # that minted it rather than recomputed here. Registration is an idempotent
+    # upsert, so a re-run reports the same stored handle.
+    ENV_THUNDER_OUT=/tmp/env-thunder-provision.log
+    : > "${ENV_THUNDER_OUT}"
+
     ENV_THUNDER_OK="false"
     for attempt in 1 2 3; do
         pkill -f "port-forward.*19000:9000" 2>/dev/null || true
@@ -2390,7 +3133,7 @@ if curl -fsSL "${SCRIPTS_BASE_URL}/add-environment-thunder.sh" -o "${ADD_ENV_THU
             ENV_NAME=default \
             DISPLAY_NAME="Default" \
             ORG_NAME=default \
-            THUNDER_HANDLE=default-idp \
+            ${ENV_THUNDER_HANDLE_ARGS[@]+"${ENV_THUNDER_HANDLE_ARGS[@]}"} \
             WAIT_TIMEOUT=300s \
             AMP_API_URL="http://localhost:19000/api/v1" \
             IDP_TOKEN_URL="http://localhost:18090/oauth2/token" \
@@ -2402,7 +3145,7 @@ if curl -fsSL "${SCRIPTS_BASE_URL}/add-environment-thunder.sh" -o "${ADD_ENV_THU
             TLS_ENABLED="${TLS_ENABLED_FLAG}" \
             SCRIPT_BASE_URL="${SCRIPTS_BASE_URL}" \
             ${ENV_THUNDER_CA_ARGS[@]+"${ENV_THUNDER_CA_ARGS[@]}"} \
-            bash "${ADD_ENV_THUNDER}"; then
+            bash "${ADD_ENV_THUNDER}" 2>&1 | tee -a "${ENV_THUNDER_OUT}"; then
             ENV_THUNDER_OK="true"
             success "env-Thunder provisioned"
             break
@@ -2427,13 +3170,45 @@ else
     error "Could not download add-environment-thunder.sh — agents will never receive an AgentID"
 fi
 
-if [ "${SCHEME}" = "https" ]; then
-    export ENV_THUNDER_ISSUER="https://default-idp.${BASE_DOMAIN}"
-else
-    # thunder_issuer() in thunder-naming.sh hardcodes :8080 for the non-TLS
-    # case — which is why the control-plane gateway serves 8080 on this profile.
-    export ENV_THUNDER_ISSUER="http://default-idp.${BASE_DOMAIN}:8080"
+# ── Resolve the env-Thunder issuer ───────────────────────────────────────────
+# Prefer the value add-environment-thunder.sh printed. It is the one that was
+# actually minted, and on the cloud profile it is the ONLY way to learn it: the
+# handle is generated by agent-manager-service, so there is nothing to compute
+# from. Whatever lands here is registered with the gateway two steps below, and
+# the two disagreeing means every AgentID token fails validation with nothing
+# in the logs pointing at the issuer as the cause.
+ENV_THUNDER_ISSUER=""
+if [ -s "${ENV_THUNDER_OUT:-/dev/null}" ]; then
+    # The script's summary block prints "  Issuer:          <url>".
+    ENV_THUNDER_ISSUER=$(grep -E '^[[:space:]]*Issuer:[[:space:]]+http' "${ENV_THUNDER_OUT}" \
+        | tail -1 | awk '{print $2}' || echo "")
 fi
+
+if [ -n "${ENV_THUNDER_ISSUER}" ]; then
+    success "env-Thunder issuer read back from provisioning output"
+elif [ "${PROFILE}" = "local" ]; then
+    # Local pins the handle, so the issuer is reconstructable. Must match
+    # thunder_issuer() exactly, including the port PATCH_RC2_THUNDER_PORT
+    # injected above; ${CP_PORT} is "" when CP_GW_HTTPS_PORT is 443.
+    if [ "${SCHEME}" = "https" ]; then
+        ENV_THUNDER_ISSUER="https://default-idp.${BASE_DOMAIN}${CP_PORT}"
+    else
+        ENV_THUNDER_ISSUER="http://default-idp.${BASE_DOMAIN}:8080"
+    fi
+    warning "Could not read the issuer from the provisioning output — falling back"
+    warning "to the pinned handle: ${ENV_THUNDER_ISSUER}"
+else
+    # Cloud has a server-generated handle and therefore no fallback. Guessing
+    # here would register a wrong issuer with the gateway, and the issuer is
+    # immutable once minted — so stop rather than mint something unusable.
+    error "Could not determine the env-Thunder issuer from the provisioning output."
+    error "The handle is generated by agent-manager-service on this profile, so there"
+    error "is nothing to fall back to. Recover it with:"
+    error "  curl -X PUT \$AMP_API_URL/orgs/default/environments/default/thunder-url"
+    error "Full provisioning output: ${ENV_THUNDER_OUT:-<not captured>}"
+    exit 1
+fi
+export ENV_THUNDER_ISSUER
 export ENV_THUNDER_JWKS="http://${ENV_THUNDER_RELEASE}-service.${ENV_THUNDER_RELEASE}.svc.cluster.local:8090/oauth2/jwks"
 
 if kubectl get ns "${ENV_THUNDER_RELEASE}" &>/dev/null; then
@@ -2503,6 +3278,16 @@ else
 fi
 
 # ── Step 24: Rancher Desktop cgroup fix ──────────────────────────────────────
+#
+# LOCAL PROFILE ONLY. This rewrites the build templates to force Podman onto
+# cgroupfs with pids_limit=0, which is a workaround for Rancher Desktop's VM.
+# A managed cluster (EKS/GKE/AKS/DOKS) runs systemd cgroup v2 correctly, so
+# there the patch is not a no-op — it downgrades the cgroup driver and removes
+# a pids guard on a cluster that may be shared. Nothing would report an error;
+# builds would simply run unconstrained.
+if [ "${PROFILE}" != "local" ]; then
+    info "Skipping Rancher Desktop cgroup workaround (profile: ${PROFILE})"
+else
 step "Applying Rancher Desktop cgroup pids workaround"
 info "Patching ClusterWorkflowTemplates for cgroup compatibility..."
 
@@ -2534,6 +3319,7 @@ json.dump(data, sys.stdout)
         info "Template not found (may not be installed yet): ${template}"
     fi
 done
+fi   # end: local-profile-only cgroup workaround
 
 # ============================================================================
 # WAIT FOR ALL PODS TO BE READY
@@ -2630,32 +3416,6 @@ else
     error "This is written once and never reconciled — delete the gateway registration and re-register."
 fi
 
-echo ""
-echo -e "${BOLD}Access URLs:${NC}"
-echo -e "  Console:      ${GREEN}${CONSOLE_PUBLIC_URL}${NC}"
-echo -e "  API:          ${API_PUBLIC_URL}"
-echo -e "  Thunder:      ${THUNDER_PUBLIC_URL}"
-echo -e "  Observer:     ${OBS_API_PUBLIC_URL}"
-echo -e "  Gateway CP:   ${CP_GW_PUBLIC_URL}"
-echo -e "  Agents:       ${SCHEME}://<org>-<project>.${AGENTS_DOMAIN}${DP_PORT}"
-echo -e "  OTLP ingest:  ${INSTRUMENTATION_URL}"
-echo -e "  env-Thunder:  ${ENV_THUNDER_ISSUER}"
-
-echo ""
-echo -e "${BOLD}Credentials:${NC}"
-# Never admin/admin: the password is generated at install time and reused
-# across reinstalls rather than rotated.
-if [ -n "${AMP_ADMIN_PASSWORD}" ]; then
-    echo -e "  Console admin:  ${BOLD}admin${NC} / ${BOLD}${AMP_ADMIN_PASSWORD}${NC}"
-else
-    echo -e "  Console admin:  admin / (kubectl get secret amp-admin-credentials -n ${THUNDER_NS} -o jsonpath='{.data.password}' | base64 -d)"
-fi
-ENV_ADMIN_PASSWORD=$(kubectl get secret "${ENV_THUNDER_RELEASE}-admin-credentials" \
-    -n "${ENV_THUNDER_RELEASE}" -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
-if [ -n "${ENV_ADMIN_PASSWORD}" ]; then
-    echo -e "  env-Thunder:    ${BOLD}admin${NC} / ${BOLD}${ENV_ADMIN_PASSWORD}${NC}  (default Environment)"
-fi
-
 if [ "${PROFILE}" = "local" ]; then
     echo ""
     echo -e "${BOLD}Host DNS:${NC}"
@@ -2664,20 +3424,8 @@ if [ "${PROFILE}" = "local" ]; then
     else
         warning "/etc/hosts has no entries for ${BASE_DOMAIN} — run: scripts/amp-hosts.sh add"
     fi
-    echo -e "  Add one line per project you create: ${BOLD}scripts/amp-hosts.sh add <project>${NC}"
 else
-    echo ""
-    echo -e "${BOLD}DNS records to publish:${NC}"
-    for entry in "openchoreo-control-plane|*.${BASE_DOMAIN}" \
-                 "openchoreo-observability-plane|${OBS_API_PUBLIC_HOST}" \
-                 "openchoreo-data-plane|${AGENTS_DOMAIN} and *.${AGENTS_DOMAIN}"; do
-        ns="${entry%%|*}"; rec="${entry#*|}"
-        addr=$(kubectl get svc gateway-default -n "${ns}" \
-            -o jsonpath='{.status.loadBalancer.ingress[0].ip}{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
-        printf '  %-40s -> %s\n' "${rec}" "${addr:-<pending>}"
-    done
-    echo "  The *.${BASE_DOMAIN} wildcard is required, not a convenience: per-environment"
-    echo "  Thunder hostnames are created after install and are reachable only through it."
+    print_dns_records
 fi
 
 echo ""
@@ -2743,7 +3491,47 @@ if [ "${DEPLOY_REGISTRY}" = "true" ]; then
 fi
 
 echo ""
-echo -e "${BOLD}Next steps:${NC}"
+echo -e "${BOLD}════════════════════════════════════════════════════════════════${NC}"
+echo -e "${BOLD} Trust the CA                                                   ${NC}"
+echo -e "${BOLD}════════════════════════════════════════════════════════════════${NC}"
+echo ""
+
+# Everything above is served over HTTPS by the self-signed openchoreo-ca chain,
+# so nothing is reachable in a browser until that CA is trusted. Printed rather
+# than done: installing a trusted root is the user's call, not the installer's.
+#
+# This is also what makes the consoles work at all. Both depend on APIs that
+# only exist in a secure context — crypto.subtle for the Thunder console's
+# ID-token check, navigator.clipboard for the AMP console's copy buttons — and
+# both fail silently over plain HTTP. See the profile block at the top.
+
+# Keyed on TLS_MODE, not on the profile: a cloud install run with
+# ALLOW_SELFSIGNED_CLOUD=1 needs this exactly as much as a laptop does, and
+# gating it on PROFILE=local meant that operator got no guidance at all. Only
+# the macOS trust command is local-specific — extracting the CA is not.
+if [ "${TLS_MODE}" = "selfsigned" ]; then
+    echo -e "${BOLD}Trust the CA (one time, REQUIRED or loading the console fails):${NC}"
+    echo -e "  Browsers reject every hostname until the self-signed CA is trusted."
+    echo -e "  ${BOLD}kubectl get secret openchoreo-ca-secret -n cert-manager \\\\${NC}"
+    echo -e "  ${BOLD}    -o jsonpath='{.data.ca\\.crt}' | base64 -d > /tmp/openchoreo-ca.crt${NC}"
+    if [ "${PROFILE}" = "local" ]; then
+        echo -e "  ${BOLD}sudo security add-trusted-cert -d -r trustRoot \\\\${NC}"
+        echo -e "  ${BOLD}    -k /Library/Keychains/System.keychain /tmp/openchoreo-ca.crt${NC}"
+        echo -e "  Then quit and reopen the browser completely."
+    else
+        echo -e "  Then distribute /tmp/openchoreo-ca.crt to every machine and service"
+        echo -e "  that talks to this install — browsers, CI runners, and any agent"
+        echo -e "  calling the gateway. On a public domain prefer TLS_MODE=acme-dns01."
+    fi
+fi
+echo ""
+
+echo ""
+echo -e "${BOLD}════════════════════════════════════════════════════════════════${NC}"
+echo -e "${BOLD} Validate Console Access                                        ${NC}"
+echo -e "${BOLD}════════════════════════════════════════════════════════════════${NC}"
+echo ""
+
 if [ "${PROFILE}" = "local" ]; then
     # Only ask for the hosts entries if they are actually missing — Step 2
     # already offers to write them, so repeating the instruction here on a
@@ -2753,12 +3541,58 @@ if [ "${PROFILE}" = "local" ]; then
         echo -e "  ${NEXT}. ${BOLD}scripts/amp-hosts.sh add${NC}   (needs sudo — not done yet)"
         NEXT=$((NEXT+1))
     fi
+    echo ""
     echo -e "  ${NEXT}. Open ${GREEN}${CONSOLE_PUBLIC_URL}${NC}"
     NEXT=$((NEXT+1))
     echo -e "  ${NEXT}. Verify offline operation by disabling Wi-Fi and reloading the console"
-    echo -e "  Add a line per new project: ${BOLD}scripts/amp-hosts.sh add <project>${NC}"
 else
     echo -e "  1. Publish the DNS records listed above"
     echo -e "  2. Open ${GREEN}${CONSOLE_PUBLIC_URL}${NC}"
 fi
-echo -e "  Mint a ${BOLD}fresh${NC} API key from the console — keys do not survive a version upgrade."
+
+
+echo ""
+echo -e "${BOLD}════════════════════════════════════════════════════════════════${NC}"
+echo -e "${BOLD} Accessing Agent Manager                                        ${NC}"
+echo -e "${BOLD}════════════════════════════════════════════════════════════════${NC}"
+echo ""
+
+echo -e "${BOLD}Access URLs:${NC}"
+echo -e "  Console:      ${GREEN}${CONSOLE_PUBLIC_URL}${NC}"
+echo -e "  API:          ${API_PUBLIC_URL}"
+echo -e "  Thunder:      ${THUNDER_PUBLIC_URL}"
+echo -e "  Observer:     ${OBS_API_PUBLIC_URL}"
+echo -e "  Gateway CP:   ${CP_GW_PUBLIC_URL}"
+echo -e "  Agents:       ${SCHEME}://<org>-<project>.${AGENTS_DOMAIN}${DP_PORT}"
+echo -e "  OTLP ingest:  ${INSTRUMENTATION_URL}"
+echo -e "  env-Thunder:  ${ENV_THUNDER_ISSUER}"
+
+echo ""
+echo -e "${BOLD}Credentials:${NC}"
+# Never admin/admin: the password is generated at install time and reused
+# across reinstalls rather than rotated.
+if [ -n "${AMP_ADMIN_PASSWORD}" ]; then
+    echo -e "  Console admin:  ${BOLD}admin${NC} / ${BOLD}${AMP_ADMIN_PASSWORD}${NC}"
+else
+    echo -e "  Console admin:  admin / (kubectl get secret amp-admin-credentials -n ${THUNDER_NS} -o jsonpath='{.data.password}' | base64 -d)"
+fi
+ENV_ADMIN_PASSWORD=$(kubectl get secret "${ENV_THUNDER_RELEASE}-admin-credentials" \
+    -n "${ENV_THUNDER_RELEASE}" -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+if [ -n "${ENV_ADMIN_PASSWORD}" ]; then
+    echo -e "  env-Thunder:    ${BOLD}admin${NC} / ${BOLD}${ENV_ADMIN_PASSWORD}${NC}  (default Environment)"
+fi
+
+# Local profile only. /etc/hosts is how the Mac resolves these names, because it
+# has no wildcard support and the local profile publishes no DNS. The cloud
+# profile's equivalent is a wildcard DNS record, already covered by "Publish the
+# DNS records listed above", so this section would send a cloud operator to edit
+# a file that has nothing to do with their install.
+if [ "${PROFILE}" = "local" ]; then
+    echo ""
+    echo -e "${BOLD}════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD} Hosts File Configuration                                       ${NC}"
+    echo -e "${BOLD}════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "If you create a new environment, such as staging, from AMP console, you need to"
+    echo -e "add a line in /etc/hosts per environment with: ${BOLD}scripts/amp-hosts.sh add <project>${NC}"
+fi
