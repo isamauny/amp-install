@@ -1,10 +1,17 @@
 #!/bin/bash
 # ============================================================================
-# WSO2 Agent Manager v1.0.0-rc3 - Automated Installation Script
+# WSO2 Agent Manager v1.0.0 (GA) - Automated Installation Script
 #
-# Mirrors https://wso2.github.io/agent-manager/docs/v1.0.0-rc3/guides/on-your-environment/
+# Mirrors https://wso2.github.io/agent-manager/docs/v1.0.0/guides/on-your-environment/
 # (source: documentation/docs/guides/on-your-environment.mdx plus the Phase 2
-#  partial _partials/_amp-installation.mdx, on branch amp-1.0.0-rc3)
+#  partial _partials/_amp-installation.mdx, on branch amp-1.0.0)
+#
+# The GA guide is BYTE-IDENTICAL to the RC3 one — verified by sha256 across
+# amp-1.0.0-rc3, amp-1.0.0, amp/v1.0.0 and main. So GA changed no instructions,
+# and neither did deployments/scripts (add-environment-thunder.sh,
+# thunder-naming.sh and ams-auth.sh are identical too). The six wso2-amp-*
+# charts changed no values keys between rc3 and 1.0.0 — only their image tags
+# rolled to v1.0.0 — so bumping VERSION below is the whole upgrade.
 #
 # Two profiles:
 #   local  Rancher Desktop (k3s) on macOS, fully usable with no Internet
@@ -14,7 +21,7 @@
 #          See the profile block below. Hostnames resolve via /etc/hosts on
 #          the Mac and a coredns-custom rewrite in-cluster.
 #   cloud  A real cluster with real DNS and TLS (EKS/GKE/AKS/DigitalOcean).
-#          Follows the RC3 main flow.
+#          Follows the GA main flow.
 #
 # The two cannot share one deployment: Thunder's issuer and the API gateway's
 # vhost are written once at first install and are never reconciled afterwards,
@@ -34,7 +41,7 @@ usage() {
     # Delimiter is HELPEOF, not USAGE: "USAGE" is a section heading in the body
     # below, and bash would end the heredoc there and parse the rest as code.
     cat <<'HELPEOF'
-amp-install-rancher.sh — install WSO2 Agent Manager v1.0.0-rc3
+amp-install-rancher.sh — install WSO2 Agent Manager v1.0.0
 
 USAGE
   ./scripts/amp-install-rancher.sh install       run the install
@@ -62,7 +69,7 @@ PROFILE
 COMMON
   BASE_DOMAIN                   default amp.test (local) / amp.apis.coach (cloud)
   TLS_MODE                      selfsigned (default) | acme-dns01 | existing
-  OPENCHOREO_VERSION            default 1.2.1
+  OPENCHOREO_VERSION            default 1.2.0
 
 TLS (when TLS_MODE is not selfsigned)
   TLS_ISSUER_NAME               ClusterIssuer name for TLS_MODE=existing
@@ -127,16 +134,29 @@ fi
 # CONFIGURATION
 # ============================================================================
 export PROFILE="${PROFILE:-local}"
-export VERSION="1.0.0-rc3"
+export VERSION="1.0.0"
 export HELM_CHART_REGISTRY="ghcr.io/wso2"
 
 # OpenChoreo plane charts (control / data / workflow / observability).
 #
-# DELIBERATELY NOT 1.1.1, which is what the RC2 install guide pins. That guide
-# is internally inconsistent: the RC2 platform-resources extension creates
-# ProjectType and ProjectReleaseBinding CRs, and those CRDs do not exist until
-# openchoreo 1.2.0 — 1.1.1 ships 32 CRDs with neither, 1.2.x ships 36 with
-# both. Installing against 1.1.1 fails at the Platform Resources step with:
+# 1.2.0, matching the GA guide AND deployments/quick-start/install.sh on the
+# amp-1.0.0 branch, which pins OPENCHOREO_VERSION="1.2.0" and then fetches the
+# k3d single-cluster values from openchoreo/openchoreo/v1.2.0. That is the
+# combination upstream actually exercises.
+#
+# It also matches the three observability module pins further down. The
+# quick-start sets exactly the same 0.5.3 / 0.6.0 / 0.6.1 under the comment
+# "community module versions compatible with OpenChoreo ${OPENCHOREO_VERSION}"
+# — i.e. validated against 1.2.0. An earlier revision of this script ran 1.2.1
+# on the stated grounds that it was what the k3d quick-start used; that was
+# wrong (the quick-start is at 1.2.0), and it left 1.2.0-validated modules
+# paired with a 1.2.1 core for no benefit.
+#
+# The FLOOR is 1.2.0 and that is a hard requirement, not a preference: the
+# platform-resources extension creates ProjectType and ProjectReleaseBinding
+# CRs, and those CRDs do not exist until openchoreo 1.2.0 — 1.1.1 (what RC2's
+# guide pinned) ships 32 CRDs with neither, 1.2.x ships 36 with both.
+# Installing against 1.1.1 fails at the Platform Resources step with:
 #
 #   no matches for kind "ProjectReleaseBinding" in version "openchoreo.dev/v1alpha1"
 #   no matches for kind "ProjectType" in version "openchoreo.dev/v1alpha1"
@@ -144,14 +164,47 @@ export HELM_CHART_REGISTRY="ghcr.io/wso2"
 # The extension chart states the requirement itself ("OpenChoreo 1.2.0+ makes
 # Project.spec.type a required reference to a (Cluster)ProjectType"), and RC2's
 # own values-op.yaml carries "OpenChoreo 1.2.0+" comments — so 1.2.x is the
-# intended target and the guide's 1.1.1 is stale. There is no way to opt out:
-# the chart exposes only displayName/description for projectType, and the name
-# is "deliberately not configurable — a contract with the service".
+# intended target. There is no way to opt out: the chart exposes only
+# displayName/description for projectType, and the name is "deliberately not
+# configurable — a contract with the service".
 #
-# 1.2.1 rather than 1.2.0 or the newest (1.2.3) because it is the version the
-# OpenChoreo k3d single-cluster quick-start runs, i.e. an exercised pairing.
-# Every value this script sets was checked against 1.2.1 and still exists.
-export OPENCHOREO_VERSION="${OPENCHOREO_VERSION:-1.2.1}"
+# Not the newest (1.2.5 at the time of writing) for the same reason: newer is
+# not the same as exercised, and nothing here needs it. Every --set key this
+# script uses on the four plane charts was re-checked against 1.2.0 and exists.
+export OPENCHOREO_VERSION="${OPENCHOREO_VERSION:-1.2.0}"
+
+# ── OFFLINE_IMAGE_PULLS ──────────────────────────────────────────────────────
+# Eleven containers across these charts default to imagePullPolicy: Always.
+# That is fatal to the offline promise: `Always` does NOT fall back to a cached
+# image, so on a cluster restart with no network the kubelet reports
+# ImagePullBackOff even though every layer is already in the node's store. It
+# is invisible until the first restart, because a freshly-installed cluster has
+# just pulled everything anyway.
+#
+# Every one is a chart default, none are set by this script, and each is
+# overridden at its own install call below — grep OFFLINE_IMAGE_PULLS:
+#
+#   console.image.pullPolicy                          wso2-agent-manager
+#   thunder.deployment.image.pullPolicy               wso2-amp-thunder-extension
+#   controllerManager.image.pullPolicy                openchoreo-control-plane
+#   argo-workflows.images.pullPolicy                  openchoreo-workflow-plane
+#   image.pullPolicy                                  gateway-operator (its own)
+#   gateway.values.gateway.controller.image.pullPolicy      gateway-operator ->
+#   gateway.values.gateway.gatewayRuntime.image.pullPolicy  per-gateway release
+#
+# Two do not fit that pattern and are handled separately, at their own steps:
+#   - fluent-bit's set-volume-ownership init container, whose image is the
+#     UNTAGGED "busybox". An untagged image implies :latest, which implies
+#     Always no matter what policy is written — and it lives inside a list, so
+#     --set would replace the whole element. See the logs module.
+#   - env-Thunder, installed by add-environment-thunder.sh, which builds its own
+#     helm arguments and offers no passthrough. Patched after that script runs.
+#
+# The gateway.values.* pair are the operator's passthrough into the per-gateway
+# Helm release it creates, so setting them here reaches pods this script never
+# installs directly.
+export PULL_POLICY="${PULL_POLICY:-IfNotPresent}"
+
 export AMP_NS="wso2-amp"
 export BUILD_CI_NS="openchoreo-workflow-plane"
 export OBSERVABILITY_NS="openchoreo-observability-plane"
@@ -160,7 +213,7 @@ export DATA_PLANE_NS="openchoreo-data-plane"
 export THUNDER_NS="amp-thunder"
 
 # How the wildcard certificates for *.${BASE_DOMAIN} and *.${AGENTS_DOMAIN}
-# are issued. RC2 requires wildcards (per-environment Thunder hostnames are
+# are issued. The guide requires wildcards (per-environment Thunder hostnames are
 # created after install with unguessable handles and are reachable only
 # through *.${BASE_DOMAIN}), which rules out HTTP-01 entirely.
 #
@@ -263,7 +316,7 @@ case "${PROFILE}" in
     export OBS_GW_HTTP_PORT=11080
     export OBS_GW_HTTPS_PORT=11085
     # Deploy CNCF Distribution in-cluster: this cluster has no registry, and
-    # RC2's chart default (host.k3d.internal:10082) does not resolve here.
+    # the chart default (host.k3d.internal:10082) does not resolve here.
     export DEPLOY_REGISTRY="${DEPLOY_REGISTRY:-true}"
     ;;
   cloud)
@@ -303,7 +356,7 @@ case "${PROFILE}" in
     echo "         Do not run this against a cluster you cannot discard." >&2
     #
     # Each plane gets its own LoadBalancer address, so every gateway owns the
-    # standard ports. RC2 is explicit that the httpPort/httpsPort overrides
+    # standard ports. The guide is explicit that the httpPort/httpsPort overrides
     # below are REQUIRED here: values-dp.yaml/values-op.yaml otherwise leave
     # the k3d ports in place and every published URL points at a port with
     # nothing behind it, with no error anywhere.
@@ -324,7 +377,7 @@ case "${PROFILE}" in
     ;;
 esac
 
-# Hostnames. RC2's certificates are single-level wildcards (*.${BASE_DOMAIN}),
+# Hostnames. The guide's certificates are single-level wildcards (*.${BASE_DOMAIN}),
 # so every management hostname must sit DIRECTLY under the base domain — no
 # second-level names like api.amp.<base>.
 export CONSOLE_PUBLIC_HOST="console.${BASE_DOMAIN}"
@@ -372,7 +425,7 @@ export OPENCHOREO_API_HOST="openchoreo-api.openchoreo-control-plane.svc.cluster.
 export AGENTS_GW_HOST="default-default.${AGENTS_DOMAIN}"
 export INSTRUMENTATION_URL="${SCHEME}://${AGENTS_GW_HOST}${DP_PORT}/otel"
 
-# Container registry used by build workflows to push agent images. RC2
+# Container registry used by build workflows to push agent images. The guide
 # requires a registry that creates repositories on push (each build pushes a
 # uniquely-named <workflow-run>-image) and that uses static credentials —
 # which rules out ECR. CNCF Distribution satisfies both.
@@ -417,7 +470,7 @@ else
 fi
 
 # ---- Platform secrets --------------------------------------------------------
-# RC2 generates real secrets for the platform's internal OAuth clients, which
+# The guide generates real secrets for the platform's OAuth clients, which
 # assumes a sealed OpenBao seeded explicitly. Step 5 now runs exactly that (see
 # scripts/openbao-values.yaml), so both profiles seed and then READ BACK from
 # OpenBao — whatever is already stored wins.
@@ -446,7 +499,7 @@ if [ "${PROFILE}" = "cloud" ]; then
     export OPENSEARCH_USERNAME="${OPENSEARCH_USERNAME:-admin}"
     export OPENSEARCH_PASSWORD="${OPENSEARCH_PASSWORD:-$(openssl rand -base64 24)}"
 else
-    # The same placeholder values RC2's own values-openbao.yaml uses. Kept
+    # The same placeholder values the guide's values-openbao.yaml uses. Kept
     # identical so this profile stays comparable with the upstream quick-start;
     # Step 5 seeds them and reads them back, so these are only the defaults for
     # a store that does not have them yet.
@@ -639,7 +692,7 @@ if [ "${HELM_MAJOR_VERSION}" != "3" ]; then
     echo ""
     echo -e "${RED}${BOLD}✗ Helm $(helm version --short 2>/dev/null) found — this installer requires Helm v3.12+${NC}"
     echo ""
-    echo "  The RC2 prerequisites state this outright: \"Helm v3.12+ (Helm 4 not"
+    echo "  The prerequisites state this outright: \"Helm v3.12+ (Helm 4 not"
     echo "  supported)\". It matches what was observed here first-hand:"
     echo ""
     echo "  Helm 4's hook lifecycle (used by cert-manager's startupapicheck, the"
@@ -695,7 +748,7 @@ fi
 # provision one, the Service sits at <pending> forever and the failure does not
 # surface until "Waiting for Control Plane LoadBalancer IP" — an hour in, with
 # CRDs, cert-manager, OpenBao and Thunder already installed and a teardown
-# needed to retry. RC3's guide recommends this same probe as a prerequisite.
+# needed to retry. The guide recommends this same probe as a prerequisite.
 #
 # Costs ~15s on Rancher Desktop, where k3s ServiceLB answers with the node IP.
 # Set SKIP_LB_PROBE=1 to skip it (e.g. re-running against a cluster already
@@ -821,7 +874,7 @@ case "${TLS_MODE}" in
             echo ""
             echo -e "${RED}${BOLD}✗ TLS_MODE=acme-dns01 needs a DNS-01 solver stanza${NC}"
             echo ""
-            echo "  RC2 requires wildcard certificates (*.${BASE_DOMAIN} and"
+            echo "  The guide requires wildcard certificates (*.${BASE_DOMAIN} and"
             echo "  *.${AGENTS_DOMAIN}), so HTTP-01 cannot be used. Supply the solver"
             echo "  for whichever provider hosts your zone:"
             echo ""
@@ -904,7 +957,7 @@ fi
 
 # check for traefik (must be removed)
 # k3s ships Traefik bound to host ports 80/443, which collides with
-# OpenChoreo's kgateway. RC2's Rancher appendix also notes that removing the
+# OpenChoreo's kgateway. The guide's Rancher appendix also notes that removing the
 # traefik-crd chart can take the Gateway API CRDs with it — this runs BEFORE
 # the Gateway API CRD step below, so they are (re-)applied afterwards either way.
 if helm status traefik -n kube-system &>/dev/null; then
@@ -1099,7 +1152,7 @@ wait_for "kgateway pods" \
 verify_pods openchoreo-control-plane
 
 # ── Step 5: OpenBao ──────────────────────────────────────────────────────────
-# NOT RC2's values-openbao.yaml. That runs `bao server -dev`, which keeps
+# NOT the guide's values-openbao.yaml. That runs `bao server -dev`, which keeps
 # everything in memory: any interruption of the pod — a laptop sleep, an OOM, a
 # VM restart — silently discards every secret written since install. The
 # platform keeps working afterwards, because the dev-mode postStart hook
@@ -1202,7 +1255,7 @@ wait_for "OpenBao pod ready" \
 verify_pods openbao
 
 # ── Bootstrap ────────────────────────────────────────────────────────────────
-# The Kubernetes auth method, policies and roles RC2 configures from its
+# The Kubernetes auth method, policies and roles the guide configures from its
 # postStart hook. That hook cannot be used outside dev mode: it runs while the
 # server is still sealed, so every write in it fails. Doing it here also makes
 # the failures visible instead of buried in a lifecycle hook.
@@ -1270,7 +1323,7 @@ success "ClusterSecretStore configured"
 
 # Seed the platform's own secrets.
 #
-# RC2 does this from the dev-mode postStart hook, which re-ran on every pod
+# The guide does this from the dev-mode postStart hook, which re-ran on every pod
 # start. Nothing re-runs it now, so the installer owns it — and because the
 # store is persistent, a re-run must NOT clobber values the platform is already
 # using. Hence write-if-absent on the local profile: the values are fixed
@@ -1322,7 +1375,7 @@ success "Platform secrets read back from OpenBao"
 # ── Step 6: TLS Setup ────────────────────────────────────────────────────────
 # Every Certificate below refers to a ClusterIssuer named ${TLS_ISSUER_NAME}
 # (default 'openchoreo-ca'), so only the issuer's definition varies by mode —
-# which is exactly the shape RC2 recommends ("copy-paste the issuer name across
+# which is exactly the shape the guide recommends ("copy-paste the issuer name across
 # all cert resources").
 step "TLS issuer (${TLS_MODE})"
 case "${TLS_MODE}" in
@@ -1430,6 +1483,7 @@ if ! check_helm_release amp-thunder-extension "${THUNDER_NS}"; then
         --version ${VERSION} \
         --namespace ${THUNDER_NS} \
         --create-namespace \
+        --set thunder.deployment.image.pullPolicy=${PULL_POLICY} `# OFFLINE_IMAGE_PULLS` \
         --set thunder.ocIngress.hostname="${THUNDER_PUBLIC_HOST}" \
         --set thunder.ocIngress.https.enabled=false \
         --set thunder.configuration.server.publicUrl="${THUNDER_PUBLIC_URL}" \
@@ -1548,6 +1602,7 @@ if ! check_helm_release openchoreo-control-plane openchoreo-control-plane; then
         --version ${OPENCHOREO_VERSION} \
         --namespace openchoreo-control-plane \
         --create-namespace \
+        --set controllerManager.image.pullPolicy=${PULL_POLICY} `# OFFLINE_IMAGE_PULLS` \
         --set gateway.httpPort="${CP_GW_HTTP_PORT}" \
         --set gateway.httpsPort="${CP_GW_HTTPS_PORT}" \
         `# Agent Manager stores plane-scoped secrets THROUGH openchoreo-api's` \
@@ -1607,7 +1662,7 @@ if [ -z "${CP_LB_IP}" ]; then
 fi
 
 # The base domain is fixed configuration now, not derived from the LB address:
-# nip.io needs public DNS to resolve and so cannot be used offline, and RC2
+# nip.io needs public DNS to resolve and so cannot be used offline, and the guide
 # needs a stable hostname anyway because Thunder's issuer and the API
 # gateway's vhost are both frozen at first install. The LB address is still
 # waited on — it gates readiness, and on the cloud profile it is what gets
@@ -1615,7 +1670,7 @@ fi
 success "Control Plane LB address: ${CP_LB_IP}"
 success "Control Plane domain: ${BASE_DOMAIN}"
 
-# Wildcard TLS cert. RC2 requires the *.${BASE_DOMAIN} wildcard specifically —
+# Wildcard TLS cert. The guide requires the *.${BASE_DOMAIN} wildcard specifically —
 # per-environment Thunder hostnames are minted after install with unguessable
 # handles and are reachable only through it.
 kubectl apply -f - <<EOF
@@ -1642,7 +1697,7 @@ wait_for "CP TLS certificate" \
 # Reconfigure with real hostnames
 info "Reconfiguring Control Plane with real hostnames and TLS..."
 
-# RC2 keeps the OpenChoreo API in-cluster (http.enabled: false) rather than
+# The guide keeps the OpenChoreo API in-cluster (http.enabled: false) rather than
 # publishing it on the gateway — Agent Manager is the only client and reaches
 # it over the Service. That also keeps api.${BASE_DOMAIN} free, so it cannot be
 # confused with api-amp.${BASE_DOMAIN}, which is the Agent Manager API.
@@ -1764,7 +1819,7 @@ success "CA certificates copied to data plane"
 # The agents domain is fixed configuration, so unlike the alpha1 flow there is
 # no need to install first, discover a LoadBalancer IP, derive a nip.io name
 # and then upgrade — the certificate can be issued up front and the plane
-# installed once, the way RC2 does it.
+# installed once, the way the guide does it.
 kubectl apply -f - <<EOF
 apiVersion: cert-manager.io/v1
 kind: Certificate
@@ -1791,7 +1846,7 @@ if ! check_helm_release openchoreo-data-plane openchoreo-data-plane; then
     # gateway to 19080/19443, because there every plane shares one host load
     # balancer and they cannot all own 443. That is exactly the situation on
     # the local profile, so those ports are kept. On the cloud profile each
-    # plane has its own LoadBalancer address and RC2 requires overriding them
+    # plane has its own LoadBalancer address and the guide requires overriding them
     # back to 80/443 — without that, the install still looks completely
     # healthy (pods Running, certificates Ready, gateway PROGRAMMED=True)
     # while every published agent URL points at a port with nothing behind it
@@ -1884,6 +1939,7 @@ if ! check_helm_release openchoreo-workflow-plane openchoreo-workflow-plane; the
         --version ${OPENCHOREO_VERSION} \
         --namespace openchoreo-workflow-plane \
         --create-namespace \
+        --set argo-workflows.images.pullPolicy=${PULL_POLICY} `# OFFLINE_IMAGE_PULLS` \
         --set clusterAgent.tls.generateCerts=true \
         `# The chart caps the Argo controller at cpu=50m/memory=64Mi, which is` \
         `# far too small for its 32 workflow workers and ~10 informers. The` \
@@ -2009,7 +2065,7 @@ kubectl apply -f https://raw.githubusercontent.com/wso2/agent-manager/amp/v${VER
     -n openchoreo-observability-plane
 
 # Wildcard cert for the observability gateway. Issued before the install so
-# the plane can come up with TLS in one pass, as RC2 does.
+# the plane can come up with TLS in one pass, as the guide does.
 kubectl apply -f - <<EOF
 apiVersion: cert-manager.io/v1
 kind: Certificate
@@ -2031,9 +2087,9 @@ wait_for "OBS TLS certificate" \
     kubectl wait --for=condition=Ready certificate/obs-gateway-tls \
     -n openchoreo-observability-plane --timeout=300s
 
-# security.oidc.issuer is set explicitly (RC2 leaves it to the chart default,
+# security.oidc.issuer is set explicitly (the guide leaves it to the chart default,
 # which is a k3d hostname). jwksUrlTlsInsecureSkipVerify only when the chain
-# is self-signed — RC2 moved it into its self-signed appendix.
+# is self-signed — the guide moved it into its self-signed appendix.
 OBS_TLS_SKIP=()
 if [ "${TLS_MODE}" = "selfsigned" ]; then
     OBS_TLS_SKIP=(--set-string security.oidc.jwksUrlTlsInsecureSkipVerify=true)
@@ -2107,10 +2163,52 @@ helm upgrade --install observability-logs-opensearch \
     ${OS_PW_ARGS[@]+"${OS_PW_ARGS[@]}"} \
     --timeout 10m
 
+# OFFLINE_IMAGE_PULLS — fluent-bit's set-volume-ownership init container.
+#
+# The chart declares it with `image: busybox` and NO tag. An untagged image
+# means :latest, and Kubernetes forces imagePullPolicy: Always for :latest
+# regardless of what is written — so this one pod blocks a restart with no
+# network even though every other container is fixed by --set.
+#
+# It has to be replayed in full rather than patched: it lives in a LIST
+# (fluent-bit.initContainers), and Helm REPLACES lists wholesale instead of
+# merging them, so --set fluent-bit.initContainers[0].imagePullPolicy=… would
+# discard the command, resources, securityContext and volumeMounts below.
+# Copied verbatim from observability-logs-opensearch 0.5.3's values.yaml with
+# two lines added; re-check it when that pin moves.
+FLUENT_BIT_VALUES="$(mktemp)"
+cat > "${FLUENT_BIT_VALUES}" <<FBEOF
+fluent-bit:
+  enabled: true
+  initContainers:
+  - name: set-volume-ownership
+    image: busybox:1.37
+    imagePullPolicy: ${PULL_POLICY}
+    command: ["sh", "-c", "chown -R 10000:10000 /var/lib/fluent-bit/db"]
+    resources:
+      limits:
+        cpu: 15m
+        memory: "32Mi"
+      requests:
+        cpu: 10m
+        memory: "24Mi"
+    securityContext:
+      capabilities:
+        drop:
+        - ALL
+      privileged: true
+      readOnlyRootFilesystem: true
+      runAsUser: 0
+    volumeMounts:
+    - name: db
+      mountPath: /var/lib/fluent-bit/db
+FBEOF
+
 helm upgrade observability-logs-opensearch \
     oci://ghcr.io/openchoreo/helm-charts/observability-logs-opensearch \
     --namespace openchoreo-observability-plane --version 0.5.3 \
-    --reuse-values --set fluent-bit.enabled=true --timeout 10m
+    --reuse-values --values "${FLUENT_BIT_VALUES}" --timeout 10m
+rm -f "${FLUENT_BIT_VALUES}"
 
 # Same chart-default resource squeeze as the Argo controller (see the Workflow
 # Plane step): prometheus-operator ships cpu=40m/memory=60Mi, and its liveness
@@ -2134,7 +2232,7 @@ helm upgrade --install observability-metrics-prometheus \
     --set kube-prometheus-stack.prometheusOperator.resources.requests.memory=128Mi \
     --version 0.6.1 --timeout 10m
 
-# 0.6.0, which RC3 now pins too — this script got here first, ahead of the
+# 0.6.0, which the guide pins too — this script got here first, ahead of the
 # guide, for the reason below. RC2 pinned 0.4.1. The 0.4.1 tracing adapter and
 # the observer disagree on the shape of a span's `attributes`: the adapter
 # returns an array, the observer unmarshals into a map, and every span details
@@ -2158,7 +2256,7 @@ helm upgrade --install observability-metrics-prometheus \
 # carry over as-is.
 #
 # The logs module above is a separate module and is not implicated in this. It
-# tracks RC3's pin (0.5.3), raised from RC2's 0.4.1.
+# tracks the guide's pin (0.5.3), raised from RC2's 0.4.1.
 helm upgrade --install observability-traces-opensearch \
     oci://ghcr.io/openchoreo/helm-charts/observability-tracing-opensearch \
     --create-namespace --namespace openchoreo-observability-plane \
@@ -2189,7 +2287,7 @@ if [ "${PROFILE}" = "cloud" ]; then
     warning "and will stop the install if it does not. Re-run afterwards — it is idempotent."
 fi
 
-# Registered as ClusterObservabilityPlane, matching both the RC2 docs and the
+# Registered as ClusterObservabilityPlane, matching both the docs and the
 # two `kubectl patch` calls below that reference it by that kind. (The alpha1
 # script registered a plain `ObservabilityPlane` here, which did not match.)
 OP_CA_CERT=$(kubectl get secret cluster-agent-tls \
@@ -2281,6 +2379,11 @@ if ! check_helm_release gateway-operator "${DATA_PLANE_NS}"; then
         --namespace ${DATA_PLANE_NS} \
         --set logging.level=info \
         --set gatewayApi.installStandardCRDs=false \
+        `# OFFLINE_IMAGE_PULLS — the gateway.values.* pair reach the per-gateway` \
+        `# Helm release the operator creates, not anything installed here.` \
+        --set image.pullPolicy=${PULL_POLICY} \
+        --set gateway.values.gateway.controller.image.pullPolicy=${PULL_POLICY} \
+        --set gateway.values.gateway.gatewayRuntime.image.pullPolicy=${PULL_POLICY} \
         --set gateway.helm.chartVersion=1.2.2 \
         --set gateway.values.gateway.controller.image.repository=ghcr.io/wso2/api-platform/gateway-controller \
         --set gateway.values.gateway.controller.image.tag=1.2.1 \
@@ -2296,7 +2399,7 @@ wait_for "Gateway Operator" \
     -n ${DATA_PLANE_NS} --timeout=300s
 
 # The gateway pods only appear later (Step 20 creates the APIGateway), so this
-# records what to check rather than checking now. RC2 is explicit that the
+# records what to check rather than checking now. The guide is explicit that the
 # chart version cannot be trusted here: the gateway chart stamps
 # app.kubernetes.io/version=1.2.0 on pods whose images are 1.2.1, because the
 # chart and the image tags move independently.
@@ -2332,12 +2435,12 @@ EOF
 success "Gateway Operator RBAC configured"
 
 # ── Step 14: Container registry ──────────────────────────────────────────────
-# Build workflows push each agent image to this registry. RC2's chart default
+# Build workflows push each agent image to this registry. The chart default
 # is host.k3d.internal:10082, which does not resolve on Rancher Desktop, and
 # the failure surfaces only on the first agent build — long after the platform
 # installs and verifies cleanly.
 #
-# RC2 requires two properties of whatever backs it: repositories must be
+# The guide requires two properties of whatever backs it: repositories must be
 # created on push (each build pushes a uniquely-named <workflow-run>-image, so
 # they cannot be pre-created — this is why ECR cannot be used), and the push
 # credentials must be static (ECR's 12-hour tokens cannot be refreshed by
@@ -2504,6 +2607,7 @@ if ! check_helm_release amp "${AMP_NS}"; then
         --version ${VERSION} \
         --namespace ${AMP_NS} \
         --create-namespace \
+        --set console.image.pullPolicy=${PULL_POLICY} `# OFFLINE_IMAGE_PULLS` \
         --set console.config.instrumentationUrl="${INSTRUMENTATION_URL}" \
         --set console.config.auth.baseUrl="${THUNDER_PUBLIC_URL}" \
         --set console.config.auth.signInRedirectURL="${CONSOLE_PUBLIC_URL}/login" \
@@ -2550,7 +2654,7 @@ verify_pods "${AMP_NS}"
 # Versions here are current as of 2026-08-31 and should NOT be chased upstream:
 #
 #   chart 0.1.1      the newest published; only 0.1.0 and 0.1.1 exist.
-#   upstream v0.4.6  the chart's OWN default, not something stale RC2 pinned.
+#   upstream v0.4.6  the chart's OWN default, not something stale the guide pinned.
 #                    kubernetes-sigs/agent-sandbox is already at v1.0.0
 #                    (2026-08-28), but this cannot simply be bumped: the chart
 #                    hardcodes its download URLs in
@@ -2631,7 +2735,7 @@ if ! check_helm_release amp-platform-resources "${DEFAULT_NS}"; then
     # stays empty, and the backend agent routes forward to has no reachable
     # host.
     #
-    # apiPlatformGatewayVhost is not mentioned in the RC2 docs, but its default
+    # apiPlatformGatewayVhost is not mentioned in the docs, but its default
     # (gateway.localhost:19080) is another k3d placeholder — it is what the
     # externally reachable gateway URLs are built from, and add-environment.sh
     # prefixes "<env>-<org>." onto the host the same way gatewayBaseDomain
@@ -2661,6 +2765,25 @@ if ! check_helm_release amp-platform-resources "${DEFAULT_NS}"; then
         --set environment.gateway.http.port="${DP_GW_HTTP_PORT}" \
         --set environment.gateway.https.host="${AGENTS_DOMAIN}" \
         --set environment.gateway.https.port="${DP_GW_HTTPS_PORT}" \
+        `# Build pods otherwise carry podSpecPatch {"hostUsers": false}, asking` \
+        `# for a Linux user namespace. Rancher Desktop runs DOCKER as its CRI` \
+        `# (node .status.nodeInfo.containerRuntimeVersion reports docker://...),` \
+        `# and cri-dockerd implements no user-namespace support at all, so the` \
+        `# kubelet rejects the pod before it is ever created:` \
+        `#   Failed to create pod sandbox: can't set spec.hostUsers: false,` \
+        `#   runtime does not support user namespaces` \
+        `# It retries forever — the build sits in Init:0/1 with no logs to read,` \
+        `# because no container ever starts. Every image build is affected` \
+        `# (containerfile-build, ballerina-buildpack-build, gcp-buildpacks-build).` \
+        `#` \
+        `# NOTE the chart documents this flag as a KERNEL limitation (idmapped` \
+        `# mounts, needs >= 6.3). That is NOT our reason: this node runs 6.18 and` \
+        `# would be fine. Do not re-enable this after checking the kernel — the` \
+        `# blocker is the container runtime, and it holds at any kernel version.` \
+        `# Switching Rancher Desktop to containerd would allow userNamespaces=true,` \
+        `# but it would also strand the registry work above, which configures` \
+        `# dockerd's /etc/docker/daemon.json (see REGISTRY notes near the top).` \
+        --set buildWorkflows.userNamespaces=false \
         --timeout 1800s
 fi
 success "Platform Resources installed"
@@ -2690,7 +2813,7 @@ if ! check_helm_release amp-observability-traces "${OBSERVABILITY_NS}"; then
     # retrieval leg only; publishing goes through the OTel gateway and is
     # unaffected.
     #
-    # oauth.authorizationServers is derived from auth.issuer by the RC2 chart,
+    # oauth.authorizationServers is derived from auth.issuer by the chart,
     # so setting it is redundant — kept explicit because the chart requires
     # the two to agree and this makes that visible.
     #
@@ -2827,7 +2950,7 @@ fi
 
 # Verify the images actually running, not the chart version. The gateway chart
 # labels its pods app.kubernetes.io/version=1.2.0 even when the images are
-# 1.2.1, so the label is actively misleading — RC2 says to check the images.
+# 1.2.1, so the label is actively misleading — the guide says to check the images.
 GW_IMAGES=$(kubectl get pods -n "${DATA_PLANE_NS}" -o jsonpath='{..image}' 2>/dev/null \
     | tr ' ' '\n' | grep -E 'gateway-(controller|runtime)' | sort -u)
 if [ -n "${GW_IMAGES}" ]; then
@@ -2887,15 +3010,15 @@ retry_cmd "Default environment gateway endpoints" 3 15 \
 # a values schema, so the old name is a hard failure, not a silently ignored
 # key — "additional properties 'thunderHostBaseDomain' not allowed". Note the
 # rename is confined to the Helm values: add-environment-thunder.sh still reads
-# the environment variable THUNDER_HOST_BASE_DOMAIN (checked against the rc3
-# copy of that script), so the export further down is NOT the same name and
+# the environment variable THUNDER_HOST_BASE_DOMAIN (checked against the
+# v1.0.0 copy of that script), so the export further down is NOT the same name and
 # must not be changed with it.
 #
 # gatewayBaseDomain is what add-environment.sh prefixes "<env>-<org>." onto,
 # so pointing it at ${AGENTS_DOMAIN} makes an added environment's gateway land
 # on the same pattern as the default one (default-default.${AGENTS_DOMAIN}) —
 # already covered by the data-plane wildcard certificate and, on the local
-# profile, by the CoreDNS rewrite. RC2 suggests a separate otel.<base> domain
+# profile, by the CoreDNS rewrite. The guide suggests a separate otel.<base> domain
 # here instead, which would need its own DNS record and certificate coverage.
 #
 # agentsHttpPort/agentsHttpsPort/gatewayVhostPort and console tlsEnabled are
@@ -2918,7 +3041,7 @@ retry_cmd "Agent Manager environment defaults" 3 15 \
     --set console.config.idpHostBaseDomain="${BASE_DOMAIN}" \
     --set-string console.config.tlsEnabled="${TLS_ENABLED_FLAG}"
 
-# WORKFLOW_PLANE_OPENBAO_VERSION is not rendered by the RC2 chart: its
+# WORKFLOW_PLANE_OPENBAO_VERSION is not rendered by the chart: its
 # `openbao` values block carries `version: v2` while `workflowPlaneOpenbao`
 # has no version key at all, so the workflow-plane KV client runs without an
 # explicit version where the platform-plane one gets v2.
@@ -2940,7 +3063,7 @@ retry_cmd "Agent Manager environment defaults" 3 15 \
 # Applied unconditionally because `kubectl set env` is idempotent — it only
 # triggers a rollout when the value actually changes. The wait below covers
 # that rollout.
-info "Setting WORKFLOW_PLANE_OPENBAO_VERSION (absent from the RC2 chart)..."
+info "Setting WORKFLOW_PLANE_OPENBAO_VERSION (absent from the chart)..."
 if kubectl set env deployment/amp-api -n "${AMP_NS}" WORKFLOW_PLANE_OPENBAO_VERSION=v2 >/dev/null 2>&1; then
     success "WORKFLOW_PLANE_OPENBAO_VERSION=v2 set on amp-api"
 else
@@ -2994,9 +3117,10 @@ fi
 # thunder-naming.sh and ams-auth.sh are downloaded as SIBLINGS deliberately.
 # The script prefers local siblings and otherwise falls back to fetching them
 # from .../agent-manager/main/deployments/scripts — the main branch, not this
-# release — so without this it could pair rc2's provisioning logic with a newer
-# naming library and derive a different issuer than the one registered with the
-# gateway two steps below. SCRIPT_BASE_URL is pinned as well, belt and braces.
+# release — so without this it could pair this release's provisioning logic
+# with a newer naming library and derive a different issuer than the one
+# registered with the gateway two steps below. SCRIPT_BASE_URL is pinned as
+# well, belt and braces.
 if curl -fsSL "${SCRIPTS_BASE_URL}/add-environment-thunder.sh" -o "${ADD_ENV_THUNDER}" \
    && curl -fsSL "${SCRIPTS_BASE_URL}/thunder-naming.sh" -o "${ENV_THUNDER_DIR}/thunder-naming.sh" \
    && curl -fsSL "${SCRIPTS_BASE_URL}/ams-auth.sh" -o "${ENV_THUNDER_DIR}/ams-auth.sh"; then
@@ -3024,7 +3148,7 @@ if curl -fsSL "${SCRIPTS_BASE_URL}/add-environment-thunder.sh" -o "${ADD_ENV_THU
     # showed the cause. Do not reintroduce that patch: making the two halves
     # agree on any port other than 443 is not possible from here.
     #
-    # RC3 does expose an escape hatch — PUT /orgs/{org}/environments/{env}/
+    # RC3 and GA do expose an escape hatch — PUT /orgs/{org}/environments/{env}/
     # thunder-url accepts {"url": "..."} instead of {"handle": "..."}, which
     # would allow an explicit port — but validateThunderURL runs it through
     # ssrf.ValidateURL, whose deny list includes 10.0.0.0/8. Any in-cluster
@@ -3076,7 +3200,7 @@ if curl -fsSL "${SCRIPTS_BASE_URL}/add-environment-thunder.sh" -o "${ADD_ENV_THU
     info "Platform Thunder JWKS for env-Thunder: ${ENV_THUNDER_JWKS_URL}"
 
     # The CA that signs that endpoint has to be trusted inside env-Thunder's
-    # pod. Read straight from the cert-manager secret rather than RC2's
+    # pod. Read straight from the cert-manager secret rather than the guide's
     # `openssl s_client` recipe: the secret works before /etc/hosts or public
     # DNS exists, and is the actual CA rather than whatever is being served.
     # (The script's own auto-detect looks for amp-local-root-ca-secret, a name
@@ -3120,7 +3244,7 @@ if curl -fsSL "${SCRIPTS_BASE_URL}/add-environment-thunder.sh" -o "${ADD_ENV_THU
     # failure into three misleading ones.
     # ── THUNDER_HANDLE: pinned locally, server-generated in the cloud ─────────
     # The handle is the label the per-environment Thunder answers to,
-    # "<handle>.${BASE_DOMAIN}", and RC2 treats it as UNGUESSABLE on purpose
+    # "<handle>.${BASE_DOMAIN}", and the guide treats it as UNGUESSABLE on purpose
     # (see thunder_host in thunder-naming.sh and agent-manager-service's
     # models/env_thunder_url.go): every environment's Thunder is reachable only
     # through the *.${BASE_DOMAIN} wildcard, so a predictable label is the one
@@ -3180,6 +3304,29 @@ if curl -fsSL "${SCRIPTS_BASE_URL}/add-environment-thunder.sh" -o "${ADD_ENV_THU
             bash "${ADD_ENV_THUNDER}" 2>&1 | tee -a "${ENV_THUNDER_OUT}"; then
             ENV_THUNDER_OK="true"
             success "env-Thunder provisioned"
+
+            # OFFLINE_IMAGE_PULLS — env-Thunder is the fourth Thunder container
+            # and the only one this script cannot reach with --set:
+            # add-environment-thunder.sh builds its own helm argument array and
+            # exposes no passthrough for extra values.
+            #
+            # Patched with kubectl rather than `helm upgrade --reuse-values` ON
+            # PURPOSE. An upgrade would re-template the whole release, and this
+            # component's issuer is IMMUTABLE once minted — re-rendering its
+            # configuration to fix a pull policy risks the one value that costs
+            # a full reinstall to get wrong. A patch touches the pod spec only.
+            #
+            # Reverted if add-environment-thunder.sh is re-run by hand; this
+            # step is idempotent and re-applies it on the next install.
+            if kubectl -n "${ENV_THUNDER_RELEASE_NS}" patch deployment \
+                    "${ENV_THUNDER_RELEASE}-deployment" \
+                    --type=json -p "[{\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/0/imagePullPolicy\",\"value\":\"${PULL_POLICY}\"}]" \
+                    &>/dev/null; then
+                success "env-Thunder image pull policy set to ${PULL_POLICY}"
+            else
+                warning "Could not set env-Thunder's image pull policy — it will"
+                warning "re-pull on restart, so this cluster is not fully offline-capable."
+            fi
             break
         fi
         warning "env-Thunder provisioning failed (attempt ${attempt}/3)"

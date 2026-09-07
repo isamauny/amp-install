@@ -1,6 +1,6 @@
 # OpenBao — durable, self-unsealing single-node setup.
 #
-# Replaces RC2's deployments/single-cluster/values-openbao.yaml, which runs
+# Replaces the guide's deployments/single-cluster/values-openbao.yaml, which runs
 # `bao server -dev`. Dev mode keeps everything in memory, so any interruption of
 # the pod — a laptop sleep, an OOM, a VM restart — silently discards every
 # secret written since install.
@@ -80,7 +80,7 @@ server:
   readinessProbe:
     enabled: true
 
-  # postStart is deliberately EMPTY. RC2 puts the whole bootstrap — Kubernetes
+  # postStart is deliberately EMPTY. The guide puts the whole bootstrap — Kubernetes
   # auth, policies, roles, seeded secrets — in a postStart hook, which cannot
   # work here: at that moment the server is sealed and rejects every write. The
   # installer performs the same bootstrap after unsealing instead, where it can

@@ -127,8 +127,8 @@ kubectl delete clusterdataplane default -n default --ignore-not-found --timeout=
     && success "ClusterDataPlane deleted" || warning "ClusterDataPlane delete reported an issue (may already be gone)"
 kubectl delete clusterworkflowplane default -n default --ignore-not-found --timeout=60s \
     && success "ClusterWorkflowPlane deleted" || warning "ClusterWorkflowPlane delete reported an issue (may already be gone)"
-# Also try the bare ObservabilityPlane kind, which is what installs before the
-# RC2 update registered.
+# Also try the bare ObservabilityPlane kind, which is what older installs
+# registered.
 kubectl delete clusterobservabilityplane default --ignore-not-found --timeout=60s &>/dev/null \
     || kubectl delete observabilityplane default -n default --ignore-not-found --timeout=60s &>/dev/null || true
 success "Observability plane registration deleted"

@@ -20,7 +20,7 @@ Installing Rancher desktop also provisions kubectl, helm as well as some docker 
 
 When you start Rancher Desktop, it provisions a Kubernetes cluster automatically. However we need to edit some preferences before installing. A window will pop up where you can set a few options. 
 
-- Select Kubernetes version to be `v1.32.x` or `v1.33.13`(which is what Agent Manager supports) - Later versions could be problematic due to CRDs versions installed by default.
+- Select Kubernetes version to be `v1.32.x` , `v1.33.13` or `v1.34.11` (which is what Agent Manager has been tested with) - Later versions could be problematic due to CRDs versions installed by default.
 - Select dockerd (moby)
 - You can configure the path changes yourself or let the installer do it. Either way, make sure you open a new shell !
 
@@ -42,11 +42,11 @@ You are ready to install!
 
 ## Agent Manager installation
 
-The script mirrors the official instructions at https://wso2.github.io/agent-manager/docs/v1.0.0-rc3/guides/on-your-environment/ and tracks the **v1.0.0-rc3** pre-release. Where it departs from the docs, the reason is written in a comment at that point in the script — most of the departures exist because the docs assume a cloud cluster where each plane owns its own LoadBalancer, whereas a single-node k3s shares one host.
+The script mirrors the official instructions at https://wso2.github.io/agent-manager/docs/v1.0.0/guides/on-your-environment/ and tracks the **v1.0.0** GA release. Where it departs from the docs, the reason is written in a comment at that point in the script — most of the departures exist because the docs assume a cloud cluster where each plane owns its own LoadBalancer, whereas a single-node k3s shares one host.
 
 > [!IMPORTANT]
 >
-> **The OpenChoreo planes are installed at 1.2.1, not the 1.2.0 the RC3 guide pins.** 1.2.1 is the version the OpenChoreo k3d single-cluster quick-start runs, i.e. an exercised pairing, and every value this script sets was checked against it. The floor is 1.2.0 regardless: the platform-resources extension creates `ProjectType` and `ProjectReleaseBinding` resources, and those CRDs do not exist before OpenChoreo **1.2.0**.
+> **The OpenChoreo planes are installed at 1.2.0**, matching both the GA guide and `deployments/quick-start/install.sh` on the `amp-1.0.0` branch — which pins `OPENCHOREO_VERSION="1.2.0"` and fetches its k3d single-cluster values from `openchoreo/openchoreo/v1.2.0`. It also matches the three observability module pins this script uses (0.5.3 / 0.6.0 / 0.6.1), which the quick-start declares as *"community module versions compatible with OpenChoreo 1.2.0"*. 1.2.0 is a hard floor as well as the target: the platform-resources extension creates `ProjectType` and `ProjectReleaseBinding` resources, and those CRDs do not exist before OpenChoreo **1.2.0**.
 
 ### Profiles
 
@@ -74,14 +74,18 @@ Every environment gets its own Thunder, reachable at `<handle>.<base-domain>` th
 
 ### Offline operation
 
-The `local` profile is designed to work with **no Internet connection** once installed. (The install itself still needs the network — Helm charts come from ghcr.io, quay.io and GitHub.)
+The `local` profile is designed to work with **no Internet connection** once installed. (The install itself still needs the network — Helm charts come from ghcr.io, quay.io and GitHub.) Two separate things have to be true for that, and the installer handles both.
 
-This is why it does not use `nip.io`, which the earlier alpha1 version of this script relied on: `nip.io` is a public DNS service and resolves nothing when you are offline. Instead, two resolvers are configured for the same real hostnames:
+**Names have to resolve.** This is why it does not use `nip.io`, which the earlier alpha1 version of this script relied on: `nip.io` is a public DNS service and resolves nothing when you are offline. Instead, two resolvers are configured for the same real hostnames:
 
 - **Pods** resolve them through a `coredns-custom` ConfigMap the installer applies, which rewrites each domain onto the right gateway `Service`. This is the same mechanism the upstream k3d layout uses. It matters for agents' OTLP exporters, the API gateway and env-Thunder, all of which dial these names from inside the cluster.
 - **Your Mac** resolves them through `/etc/hosts`, pointing at `127.0.0.1` — Rancher Desktop's ssh forwarder binds every LoadBalancer port on the host, so this reaches each plane gateway on its own port and, unlike the VM's IP address, does not change when the VM restarts.
 
 `.localhost` is not an option for either side, which is worth knowing if you are tempted: macOS does not resolve multi-label `.localhost` names (`getaddrinfo("console.amp.localhost")` and `curl` both fail), and Go and Python resolvers inside pods do not special-case it either.
+
+**Images must not be re-pulled.** Eleven containers across these charts default to `imagePullPolicy: Always`, and `Always` does **not** fall back to a cached image — with no network the kubelet reports `ImagePullBackOff` even though every layer is already in the node's store. The installer overrides all of them to `IfNotPresent` (grep `OFFLINE_IMAGE_PULLS` in the script). Two need more than a `--set`: `fluent-bit`'s init container is declared as the untagged `busybox`, and an untagged image means `:latest`, which Kubernetes forces to `Always` whatever policy is written; and env-Thunder is installed by `add-environment-thunder.sh`, which builds its own Helm arguments and offers no passthrough, so it is patched afterwards instead.
+
+This failure mode is invisible until the first restart — a freshly-installed cluster has just pulled everything anyway — so **test it by restarting with the network off**, not by inspecting a running cluster. Note also that a `helm upgrade` you run yourself re-renders chart defaults and puts `Always` back; re-run the installer afterwards.
 
 > [!NOTE]
 >
@@ -115,7 +119,7 @@ The `install` verb is required: running the script with no arguments prints its 
 
 ```
 ────────────────────────────────────────────────────────────────
- About to install WSO2 Agent Manager v1.0.0-rc3
+ About to install WSO2 Agent Manager v1.0.0
 ────────────────────────────────────────────────────────────────
   Context:      rancher-desktop
   Cluster:      https://127.0.0.1:6443
@@ -206,7 +210,7 @@ Then quit and reopen the browser completely.
 
 ### Secret store (OpenBao)
 
-RC3 installs OpenBao with `bao server -dev`, which keeps everything **in memory**. Any interruption of the pod — a laptop sleep, an OOM kill, a VM restart — silently discards every secret written since install.
+The guide installs OpenBao with `bao server -dev`, which keeps everything **in memory**. Any interruption of the pod — a laptop sleep, an OOM kill, a VM restart — silently discards every secret written since install.
 
 What makes it hard to spot is that the platform appears to recover: dev mode's `postStart` hook re-seeds the platform's *own* placeholder secrets on every start, so the console, Thunder and the gateways all keep working. Only what was written at **runtime** is gone — agent API keys above all. The next agent you create fails with a 500 whose text never mentions OpenBao:
 
@@ -233,7 +237,7 @@ kubectl get secret openbao-root-token -n openbao -o jsonpath='{.data.root-token}
 
 ### Container registry
 
-The `local` profile deploys **CNCF Distribution** in-cluster and points the platform at it. Distribution satisfies both of RC3's requirements: it creates repositories on push (each build pushes a uniquely-named `<workflow-run>-image`, so they cannot be pre-created — this is why ECR cannot be used), and it needs no rotating credentials. The installer also writes `/etc/rancher/k3s/registries.yaml` inside the Lima VM via `rdctl` so kubelet will pull over plain HTTP.
+The `local` profile deploys **CNCF Distribution** in-cluster and points the platform at it. Distribution satisfies both of the guide's requirements: it creates repositories on push (each build pushes a uniquely-named `<workflow-run>-image`, so they cannot be pre-created — this is why ECR cannot be used), and it needs no rotating credentials. The installer also writes `/etc/rancher/k3s/registries.yaml` inside the Lima VM via `rdctl` so kubelet will pull over plain HTTP.
 
 It ships with **no authentication**. That is fine *only* for a cluster-local evaluation registry. To use your own registry instead:
 
