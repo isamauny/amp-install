@@ -113,6 +113,19 @@ server:
     - name: unsealer
       image: quay.io/openbao/openbao:2.5.1
       imagePullPolicy: IfNotPresent
+      # MUST be repeated here. server.volumeMounts above applies ONLY to the
+      # server container — the chart does not propagate it to extraContainers,
+      # which carry their own. Without this the sidecar has no
+      # /openbao/unseal at all, its `[ -r ... ]` test is silently false, and it
+      # loops forever having printed "unsealer: watching" exactly once. The
+      # server stays sealed after every restart, external-secrets then fails
+      # with "Vault is sealed" on ClusterSecretStore/default, and monitors stop
+      # running. Nothing logs an error anywhere: the sidecar is Ready, the pod
+      # is Running, and only the server container reports NotReady.
+      volumeMounts:
+        - name: unseal
+          mountPath: /openbao/unseal
+          readOnly: true
       env:
         - name: BAO_ADDR
           value: http://127.0.0.1:8200
