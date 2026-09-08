@@ -1124,6 +1124,28 @@ if ! check_helm_release external-secrets external-secrets; then
         --create-namespace \
         --version 1.3.2 \
         --set installCRDs=true \
+        `# The chart ships concurrent=1 — a SINGLE reconcile worker. That is far` \
+        `# too few for this platform: every monitor evaluation run creates its own` \
+        `# ExternalSecret with refreshInterval 15s, and those runs are never` \
+        `# garbage-collected (WorkflowRun.spec.ttlAfterCompletion is unset on the` \
+        `# monitor-evaluation-workflow the evaluation extension ships, and that` \
+        `# chart exposes no value for it). They accumulate at ~200/day.` \
+        `#` \
+        `# Measured on a 3-day-old install with 558 ExternalSecrets: demand is` \
+        `# 558/15s = 37 reconciles/sec, actual throughput with one worker was` \
+        `# ~3/sec. The queue never drains, so a NEWLY created ExternalSecret waits` \
+        `# behind hundreds of stale ones — median refresh age had degraded from` \
+        `# the requested 15s to 112s, max 210s, with several never reconciled at` \
+        `# all. The visible symptom is every monitor pod failing on startup with` \
+        `#   Error: secret "<run>-amp-publisher-credentials" not found` \
+        `# (CreateContainerConfigError), retrying under kubelet backoff for` \
+        `# minutes before the secret finally appears.` \
+        `#` \
+        `# Raising this to 10 took the median back to 14s and cleared the backlog.` \
+        `# It treats the symptom, not the cause — the cause is the unbounded run` \
+        `# accumulation, which is upstream's to fix — but it keeps a long-running` \
+        `# cluster usable. Cheap: these workers are idle between refreshes.` \
+        --set concurrent=10 \
         --wait --timeout 180s
 fi
 wait_for "external-secrets pods" \
