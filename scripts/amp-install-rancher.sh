@@ -2873,9 +2873,71 @@ if ! check_helm_release amp-evaluation-extension "${BUILD_CI_NS}"; then
         oci://${HELM_CHART_REGISTRY}/wso2-amp-evaluation-extension \
         --version ${VERSION} \
         --namespace ${BUILD_CI_NS} \
+        `# The evaluation job runs under a restrictive egress NetworkPolicy` \
+        `# (amp-evaluation-job-egress), and k3s ENFORCES NetworkPolicy, so its` \
+        `# LLM-gateway rule has to be right or the LLM judge cannot connect.` \
+        `#` \
+        `# With llmGateway.namespace empty the chart selects the gateway namespace` \
+        `# by the label amp.wso2.com/api-platform-gateway=true — which NOTHING` \
+        `# applies. Verified: no namespace in the cluster carries it, and the only` \
+        `# occurrence of that label in any AMP chart is inside a ComponentType, not` \
+        `# on a Namespace. So the rule matches zero namespaces and every LLM call` \
+        `# is dropped. Naming the namespace adds a second, matching selector` \
+        `# alongside the label one -- entries in a to list are OR-ed.` \
+        `#` \
+        `# The PORT stays the chart default 22893 — do NOT "correct" it to` \
+        `# DP_GW_HTTPS_PORT. agent-manager-service logs an external proxy URL` \
+        `# ("Provisioned LLM proxy ... https://default-default.agents.<base>:19443/<id>")` \
+        `# which is what CLIENTS use, but the monitor pod dials the gateway` \
+        `# in-cluster over plain HTTP — read its own LLM_API_BASE env var:` \
+        `#   http://api-platform-<org>-<env>-gw-gateway-gateway-runtime.<dp-ns>:22893/<id>` \
+        `# 22893 is the gateway-runtime container port. 19443 is kgateway, a` \
+        `# different pod and a different hop.` \
+        `#` \
+        `# Symptom when wrong: the LLM judge is the ONLY evaluator that fails.` \
+        `# Length/Iteration/Latency need no LLM and pass, so the run still reports` \
+        `# status=SUCCESS and the console shows a bare connection failure. The` \
+        `# real error is only in the monitor pod log:` \
+        `#   Helpfulness: LLM judge failed after 3 attempts:` \
+        `#   All connection attempts failed [model=mistral/...]` \
+        `# and the gateway access log shows NOTHING, because the packet never` \
+        `# leaves the pod — there is no server-side trace of it anywhere.` \
+        --set "networkPolicy.evaluationJob.llmGateway.namespace=${DATA_PLANE_NS}" \
         --timeout 1800s
 fi
 success "Evaluation Extension installed"
+
+# ── Monitor run retention ────────────────────────────────────────────────────
+# Every monitor evaluation creates a WorkflowRun CR plus its own ExternalSecret
+# (refreshInterval 15s) and Secret. NOTHING deletes them: Argo garbage-collects
+# its own Workflow objects, but the OpenChoreo-side resources persist forever.
+# Measured here at ~204 runs/day.
+#
+# That is not merely untidy. external-secrets re-reads every one of those
+# ExternalSecrets from OpenBao every 15 seconds, for runs that finished days
+# ago, so demand grows without bound. At 558 accumulated ExternalSecrets the
+# queue was 12x oversubscribed and NEW runs were starved — see the
+# concurrent=10 note at the External Secrets step for the measurements.
+#
+# WorkflowRun.spec.ttlAfterCompletion fixes it at the source, and the CRD
+# documents the value as "copied from the Workflow template" — but the template
+# the evaluation extension ships leaves it unset, and the chart exposes no value
+# for it (checked in 1.0.0-rc3 and 1.0.0). So it has to be patched onto the CR
+# after the chart creates it.
+#
+# Applied with kubectl rather than a chart value because there is no chart
+# value. A later `helm upgrade` of this release re-renders the Workflow without
+# the field; re-running this installer re-applies it.
+MONITOR_RUN_TTL="${MONITOR_RUN_TTL:-24h}"
+if kubectl -n "${DEFAULT_NS}" patch workflow.openchoreo.dev monitor-evaluation-workflow \
+        --type=merge -p "{\"spec\":{\"ttlAfterCompletion\":\"${MONITOR_RUN_TTL}\"}}" &>/dev/null; then
+    success "Monitor runs will be reaped after ${MONITOR_RUN_TTL}"
+else
+    warning "Could not set ttlAfterCompletion on monitor-evaluation-workflow."
+    warning "Monitor runs will accumulate (~200/day), each with a 15s-refresh"
+    warning "ExternalSecret, until the secret pipeline starves. See the"
+    warning "External Secrets step for symptoms."
+fi
 
 # ── Step 20: API Platform Gateway Extension ───────────────────────────────────
 step "API Platform Gateway Extension (v${VERSION})"
