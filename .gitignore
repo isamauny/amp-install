@@ -1,3 +1,4 @@
 .DS_Store
 scripts/amp_forward.sh
 scripts/install.log
+docs/custom-gateway-images.md

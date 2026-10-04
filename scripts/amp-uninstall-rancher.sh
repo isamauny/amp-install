@@ -21,6 +21,8 @@ EXTERNAL_SECRETS_NS="external-secrets"
 CERT_MANAGER_NS="cert-manager"
 DEFAULT_NS="default"
 SANDBOX_NS="agent-sandbox-system"
+# In-cluster Redis for the gateway policies (scripts/amp-redis.sh).
+REDIS_NS="${REDIS_NS:-amp-redis}"
 # Each Environment gets its own Thunder, named <release>-<org>-<env>. Only the
 # default Environment's is created by the installer; any added later needs
 # removing by hand.
@@ -32,7 +34,7 @@ BASE_DOMAIN="${BASE_DOMAIN:-amp.test}"
 NAMESPACES=(
     "${AMP_NS}" "${THUNDER_NS}" "${ENV_THUNDER_NS}" "${OBSERVABILITY_NS}" "${WORKFLOW_NS}" \
     "${DATA_PLANE_NS}" "${CONTROL_PLANE_NS}" "${SANDBOX_NS}" "${OPENBAO_NS}" \
-    "${EXTERNAL_SECRETS_NS}" "${CERT_MANAGER_NS}"
+    "${EXTERNAL_SECRETS_NS}" "${CERT_MANAGER_NS}" "${REDIS_NS}"
 )
 
 # Helm releases as "name:namespace" pairs

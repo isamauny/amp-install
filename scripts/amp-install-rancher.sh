@@ -46,6 +46,8 @@ amp-install-rancher.sh — install WSO2 Agent Manager v1.0.0
 USAGE
   ./scripts/amp-install-rancher.sh install       run the install
   ./scripts/amp-install-rancher.sh install --yes skip the confirmation prompt
+  ./scripts/amp-install-rancher.sh install --reason "CHG-1234: fresh install"
+                                                 why — recorded in the audit trail
   ./scripts/amp-install-rancher.sh --help        this message
   ./scripts/amp-install-rancher.sh               this message
 
@@ -82,9 +84,25 @@ REGISTRY
   REGISTRY_HOST / REGISTRY_PORT components of the default endpoint
   REGISTRY_TLS_VERIFY           false on local, true on cloud
 
+REDIS (gateway policies: semantic-cache vector store, distributed rate limits)
+  DEPLOY_REDIS                  true on local, false on cloud — deployed by
+                                scripts/amp-redis.sh, which also manages it later
+  REDIS_IMAGE / REDIS_MAXMEMORY see ./scripts/amp-redis.sh --help
+
 PRE-FLIGHT
   SKIP_LB_PROBE=1               skip the LoadBalancer provisioning check
   LB_PROBE_TIMEOUT              default 180s
+
+GATEWAY
+  GATEWAY_CONTROLLER_IMAGE / _TAG, GATEWAY_RUNTIME_IMAGE / _TAG
+                                gateway images (a custom gateway-builder build,
+                                or the upstream 1.2.1 images)
+  GATEWAY_POLICIES_PATH         detected from the controller image; override only
+
+AUDIT
+  Every run writes an audit record (settings, gateway images, each Helm release
+  installed or upgraded, outcome) — ./scripts/amp-audit.sh list.
+  AMP_AUDIT_REQUIRE_REASON=1    make --reason mandatory
 
 ESCAPE HATCHES (each disables a guard — read the message it prints first)
   ALLOW_UNTESTED_CLOUD=1        run the unverified cloud profile
@@ -110,15 +128,18 @@ HELPEOF
 # pre-flight, which is where the target cluster is actually shown.
 ASSUME_YES=0
 ACTION=""
+AUDIT_REASON="${AMP_AUDIT_REASON:-}"
 while [ $# -gt 0 ]; do
     case "$1" in
         --help|-h|help) usage; exit 0 ;;
         --yes|-y)       ASSUME_YES=1 ;;
+        --reason)       [ $# -ge 2 ] || { echo "--reason needs a value" >&2; exit 1; }
+                        AUDIT_REASON="$2"; shift ;;
         install)        ACTION="install" ;;
         *)
             echo "Unknown argument: $1" >&2
             echo "" >&2
-            echo "This installer takes no flags beyond --yes — it is configured with" >&2
+            echo "This installer takes no flags beyond --yes and --reason — it is configured with" >&2
             echo "environment variables. Run with --help to see them." >&2
             exit 1
             ;;
@@ -130,12 +151,23 @@ if [ -z "${ACTION}" ]; then
     exit 0
 fi
 
+# shellcheck source=amp-audit.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/amp-audit.sh"
+
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 export PROFILE="${PROFILE:-local}"
 export VERSION="1.0.0"
 export HELM_CHART_REGISTRY="ghcr.io/wso2"
+# Custom gateway build for this install. Defaults only: a value passed on the
+# command line (GATEWAY_RUNTIME_TAG=1.2.1-p2 ./scripts/amp-install-rancher.sh …)
+# wins. GATEWAY_POLICIES_PATH is detected from the controller image in
+# pre-flight; set it only to override the detection.
+export GATEWAY_RUNTIME_IMAGE="${GATEWAY_RUNTIME_IMAGE:-localhost/upgraded-ai-gateway-gateway-runtime}"
+export GATEWAY_RUNTIME_TAG="${GATEWAY_RUNTIME_TAG:-1.2.1}"
+export GATEWAY_CONTROLLER_IMAGE="${GATEWAY_CONTROLLER_IMAGE:-localhost/upgraded-ai-gateway-gateway-controller}"
+export GATEWAY_CONTROLLER_TAG="${GATEWAY_CONTROLLER_TAG:-1.2.1}"
 
 # OpenChoreo plane charts (control / data / workflow / observability).
 #
@@ -204,6 +236,32 @@ export OPENCHOREO_VERSION="${OPENCHOREO_VERSION:-1.2.0}"
 # Helm release it creates, so setting them here reaches pods this script never
 # installs directly.
 export PULL_POLICY="${PULL_POLICY:-IfNotPresent}"
+
+# ── API Platform gateway images ──────────────────────────────────────────────
+# Override to run a custom gateway build instead of the upstream images. The
+# defaults are the 1.2.1 images Step 13 pins (see there for why not the chart's
+# own 1.2.0). They are handed to gateway-operator, which passes them into every
+# per-gateway release it creates — so they only take effect for gateways the
+# operator creates AFTER it is installed with them. Reinstalling the operator
+# does not redeploy existing gateways: their <name>-gw releases keep the old
+# images until upgraded directly. To change images on a running install, use
+# scripts/amp-gateway-images.sh (same variables) instead of re-running this.
+export GATEWAY_CONTROLLER_IMAGE="${GATEWAY_CONTROLLER_IMAGE:-ghcr.io/wso2/api-platform/gateway-controller}"
+export GATEWAY_CONTROLLER_TAG="${GATEWAY_CONTROLLER_TAG:-1.2.1}"
+export GATEWAY_RUNTIME_IMAGE="${GATEWAY_RUNTIME_IMAGE:-ghcr.io/wso2/api-platform/gateway-runtime}"
+export GATEWAY_RUNTIME_TAG="${GATEWAY_RUNTIME_TAG:-1.2.1}"
+# Where the controller reads policy definitions, relative to /app in its image.
+# The chart default ./default-policies holds the upstream set only. The gateway
+# builder writes the full set — upstream plus custom, at the versions compiled
+# into the runtime — to ./policies, and leaves ./default-policies untouched, so
+# a custom image on the default path loads, advertises and lets Agent Manager
+# show none of its custom policies, with no error anywhere. Custom builds need
+# ./policies.
+#
+# Left empty here and resolved in pre-flight from the controller image itself
+# (./policies when it has /app/policies, else the chart default), so the path
+# cannot drift from the image. Set it explicitly only to override that.
+export GATEWAY_POLICIES_PATH="${GATEWAY_POLICIES_PATH:-}"
 
 export AMP_NS="wso2-amp"
 export BUILD_CI_NS="openchoreo-workflow-plane"
@@ -318,6 +376,9 @@ case "${PROFILE}" in
     # Deploy CNCF Distribution in-cluster: this cluster has no registry, and
     # the chart default (host.k3d.internal:10082) does not resolve here.
     export DEPLOY_REGISTRY="${DEPLOY_REGISTRY:-true}"
+    # Redis 8 for semantic-cache (vector store) and optional distributed
+    # rate limits — the gateway policies have no in-cluster store otherwise.
+    export DEPLOY_REDIS="${DEPLOY_REDIS:-true}"
     ;;
   cloud)
     # ---- Real cluster, real DNS, real TLS ------------------------------------
@@ -370,6 +431,8 @@ case "${PROFILE}" in
     export OBS_GW_HTTP_PORT=80
     export OBS_GW_HTTPS_PORT=443
     export DEPLOY_REGISTRY="${DEPLOY_REGISTRY:-false}"
+    # Bring a managed Redis 8 (or Redis Stack) and enter it in amp-guardrails.sh.
+    export DEPLOY_REDIS="${DEPLOY_REDIS:-false}"
     ;;
   *)
     echo "Unknown PROFILE '${PROFILE}' — expected 'local' or 'cloud'" >&2
@@ -731,6 +794,70 @@ fi
 K8S_VERSION=$(kubectl version -o json 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['serverVersion']['gitVersion'])" 2>/dev/null || echo "unknown")
 success "Cluster connected — ${K8S_VERSION}"
 
+# BASE_DOMAIN must match the existing install. Thunder's issuer is frozen at
+# first install and its release is skipped on re-runs, but every other step
+# re-applies with the current BASE_DOMAIN — so a re-run that forgot the
+# BASE_DOMAIN it was installed with silently moves the control-plane values,
+# gateway certificates and CoreDNS rewrites to the default domain, and the
+# mismatch only surfaces at the Thunder issuer check, after the damage. Read
+# the domain back from Thunder's route (created once, with the issuer) and stop
+# before anything is changed.
+EXISTING_THUNDER_HOST=$(kubectl get httproute amp-thunder-extension -n openchoreo-control-plane \
+    -o jsonpath='{.spec.hostnames[0]}' 2>/dev/null || echo "")
+if [ -n "${EXISTING_THUNDER_HOST}" ] && [ "${EXISTING_THUNDER_HOST}" != "${THUNDER_PUBLIC_HOST}" ]; then
+    echo ""
+    echo -e "${RED}${BOLD}✗ This cluster was installed with BASE_DOMAIN=${EXISTING_THUNDER_HOST#thunder.}${NC}"
+    echo ""
+    echo "  This run has BASE_DOMAIN=${BASE_DOMAIN}. Thunder's issuer cannot change"
+    echo "  after install, and continuing would move every other component to"
+    echo "  ${BASE_DOMAIN} around it. Re-run with:"
+    echo ""
+    echo -e "  ${BOLD}BASE_DOMAIN=${EXISTING_THUNDER_HOST#thunder.} $0 $*${NC}"
+    echo ""
+    exit 1
+fi
+[ -n "${EXISTING_THUNDER_HOST}" ] && success "BASE_DOMAIN matches the existing install (${BASE_DOMAIN})"
+
+# Gateway images. A custom build exists only in the node's image store (Rancher
+# Desktop's dockerd, shared with the host docker CLI), so a missing one is an
+# ImagePullBackOff at the gateway step, most of an hour in. Check it now, while
+# nothing has changed — and read the policies path from the same image, so it
+# cannot drift from what the image actually contains.
+GW_CTRL_REF="${GATEWAY_CONTROLLER_IMAGE}:${GATEWAY_CONTROLLER_TAG}"
+GW_RT_REF="${GATEWAY_RUNTIME_IMAGE}:${GATEWAY_RUNTIME_TAG}"
+GW_POLICIES_SOURCE="GATEWAY_POLICIES_PATH"
+if command -v docker &>/dev/null && docker info &>/dev/null; then
+    for ref in "${GW_CTRL_REF}" "${GW_RT_REF}"; do
+        if docker image inspect "${ref}" &>/dev/null; then
+            success "Gateway image present: ${ref}"
+        elif [[ "${ref}" == localhost/* ]]; then
+            error "Gateway image ${ref} is not in the local image store, and a localhost/ image cannot be pulled"
+            info "Build or tag it first (docker context: $(docker context show 2>/dev/null || echo unknown)), or set GATEWAY_*_IMAGE / _TAG"
+            exit 1
+        else
+            info "Gateway image ${ref} is not local — the node will pull it"
+        fi
+    done
+    if [ -z "${GATEWAY_POLICIES_PATH}" ]; then
+        # Only a local image is inspected: docker create would otherwise pull it.
+        GATEWAY_POLICIES_PATH="./default-policies"; GW_POLICIES_SOURCE="chart default"
+        if docker image inspect "${GW_CTRL_REF}" &>/dev/null; then
+            GW_CID=$(docker create "${GW_CTRL_REF}" 2>/dev/null || true)
+            if [ -n "${GW_CID}" ] && docker cp "${GW_CID}:/app/policies" - >/dev/null 2>&1; then
+                GATEWAY_POLICIES_PATH="./policies"; GW_POLICIES_SOURCE="detected: image has /app/policies"
+            fi
+            [ -n "${GW_CID}" ] && docker rm "${GW_CID}" >/dev/null 2>&1 || true
+        fi
+    fi
+else
+    warning "docker not available — gateway images not checked, policies path not detected"
+    if [ -z "${GATEWAY_POLICIES_PATH}" ]; then
+        GATEWAY_POLICIES_PATH="./default-policies"; GW_POLICIES_SOURCE="chart default (not detected)"
+    fi
+fi
+export GATEWAY_POLICIES_PATH
+success "Gateway policies path: ${GATEWAY_POLICIES_PATH} (${GW_POLICIES_SOURCE})"
+
 # node count & resources
 NODE_COUNT=$(kubectl get nodes --no-headers 2>/dev/null | wc -l | tr -d ' ')
 info "Nodes: ${NODE_COUNT}"
@@ -928,6 +1055,8 @@ echo -e "  Cluster:      ${CURRENT_SERVER}"
 echo -e "  Profile:      ${PROFILE}"
 echo -e "  Base domain:  ${BASE_DOMAIN}"
 echo -e "  TLS mode:     ${TLS_MODE}"
+echo -e "  Gateway:      ${GW_CTRL_REF}"
+echo -e "                ${GW_RT_REF}  (policies ${GATEWAY_POLICIES_PATH})"
 echo -e "  Namespaces:   wso2-amp, openchoreo-{control,data,workflow,observability}-plane,"
 echo -e "                amp-thunder, openbao, cert-manager, external-secrets"
 echo ""
@@ -954,6 +1083,51 @@ else
         *) echo ""; info "Aborted — nothing was changed."; exit 0 ;;
     esac
 fi
+
+# ── Audit record ─────────────────────────────────────────────────────────────
+# Everything from here on changes the cluster. The record holds the settings
+# this run used and, at the end, every Helm release it installed, upgraded or
+# removed (before → after revision). The EXIT trap writes it even when the run
+# stops early, marked failed. Only named settings are recorded — never the
+# generated client secrets or passwords this script handles.
+audit_reason
+audit_begin "install" "${BASH_SOURCE[0]}"
+AUDIT_SUMMARY_SO_FAR="install v${VERSION} (${PROFILE}, ${BASE_DOMAIN})"
+AUDIT_HELM_BEFORE=$(mktemp)
+helm list -A -o json > "${AUDIT_HELM_BEFORE}" 2>/dev/null || echo '[]' > "${AUDIT_HELM_BEFORE}"
+for kv in "PROFILE=${PROFILE}" "VERSION=${VERSION}" "OPENCHOREO_VERSION=${OPENCHOREO_VERSION}" \
+          "BASE_DOMAIN=${BASE_DOMAIN}" "TLS_MODE=${TLS_MODE}" "PULL_POLICY=${PULL_POLICY}" \
+          "gateway controller=${GW_CTRL_REF} @$(docker image inspect --format '{{.Id}}' "${GW_CTRL_REF}" 2>/dev/null || echo unknown)" \
+          "gateway runtime=${GW_RT_REF} @$(docker image inspect --format '{{.Id}}' "${GW_RT_REF}" 2>/dev/null || echo unknown)" \
+          "gateway policies path=${GATEWAY_POLICIES_PATH} (${GW_POLICIES_SOURCE})" \
+          "DEPLOY_REDIS=${DEPLOY_REDIS} (recorded separately by amp-redis.sh)"; do
+    audit_add settings "${kv}"
+done
+
+# Records every Helm release this run changed. Idempotent: called at the end
+# and again from the EXIT trap, whichever comes first wins.
+audit_record_helm_changes() {
+    [ "${AUDIT_HELM_RECORDED:-0}" = "1" ] && return 0
+    AUDIT_HELM_RECORDED=1
+    local changes
+    changes=$(helm list -A -o json 2>/dev/null | python3 -c '
+import json, sys
+before = {(r["namespace"], r["name"]): r for r in json.load(open(sys.argv[1]))}
+after = {(r["namespace"], r["name"]): r for r in json.load(sys.stdin)}
+fmt = lambda r: r["chart"] + " rev " + str(r["revision"]) + " (" + r["status"] + ")"
+for k in sorted(set(before) | set(after)):
+    b, a = before.get(k), after.get(k)
+    if b and a and b["revision"] == a["revision"]:
+        continue
+    print("|".join([k[0] + "/" + k[1], fmt(b) if b else "—", fmt(a) if a else "removed"]))
+' "${AUDIT_HELM_BEFORE}" 2>/dev/null || true)
+    while IFS='|' read -r target before_v after_v; do
+        [ -n "${target}" ] && audit_change "${target}" "helm release" "${before_v}" "${after_v}"
+    done <<< "${changes}"
+    rm -f "${AUDIT_HELM_BEFORE}"
+    return 0
+}
+trap 'rc=$?; audit_record_helm_changes; audit_on_exit ${rc}' EXIT
 
 # check for traefik (must be removed)
 # k3s ships Traefik bound to host ports 80/443, which collides with
@@ -2407,10 +2581,12 @@ if ! check_helm_release gateway-operator "${DATA_PLANE_NS}"; then
         --set gateway.values.gateway.controller.image.pullPolicy=${PULL_POLICY} \
         --set gateway.values.gateway.gatewayRuntime.image.pullPolicy=${PULL_POLICY} \
         --set gateway.helm.chartVersion=1.2.2 \
-        --set gateway.values.gateway.controller.image.repository=ghcr.io/wso2/api-platform/gateway-controller \
-        --set gateway.values.gateway.controller.image.tag=1.2.1 \
-        --set gateway.values.gateway.gatewayRuntime.image.repository=ghcr.io/wso2/api-platform/gateway-runtime \
-        --set gateway.values.gateway.gatewayRuntime.image.tag=1.2.1 \
+        `# GATEWAY_*_IMAGE / _TAG — default 1.2.1 upstream, overridable at the top` \
+        --set gateway.values.gateway.controller.image.repository="${GATEWAY_CONTROLLER_IMAGE}" \
+        --set-string gateway.values.gateway.controller.image.tag="${GATEWAY_CONTROLLER_TAG}" \
+        --set gateway.values.gateway.gatewayRuntime.image.repository="${GATEWAY_RUNTIME_IMAGE}" \
+        --set-string gateway.values.gateway.gatewayRuntime.image.tag="${GATEWAY_RUNTIME_TAG}" \
+        --set gateway.values.gateway.config.controller.policies.definitions_path="${GATEWAY_POLICIES_PATH}" \
         --set gateway.values.gateway.controller.encryptionKeys.enabled=true \
         --set gateway.values.gateway.controller.encryptionKeys.secretName=gateway-encryption-keys \
         --timeout 600s
@@ -2993,10 +3169,13 @@ if ! check_helm_release api-platform-default-default "${DATA_PLANE_NS}"; then
         --set gateway.hostname="${AGENTS_GW_HOST}" \
         --set agentManager.idp.existingSecret=gateway-idp-credentials \
         --timeout 1800s
+    # Only on the run that installed it: the Job carries
+    # ttlSecondsAfterFinished: 86400, so on any re-run more than a day later it
+    # is gone and the wait fails with NotFound on a perfectly healthy gateway.
+    wait_for "API Platform bootstrap job" \
+        kubectl wait --for=condition=complete job/api-platform-default-default-bootstrap \
+        -n ${DATA_PLANE_NS} --timeout=300s
 fi
-wait_for "API Platform bootstrap job" \
-    kubectl wait --for=condition=complete job/api-platform-default-default-bootstrap \
-    -n ${DATA_PLANE_NS} --timeout=300s
 
 # No extra HTTPRoute is needed for OTLP ingest. The extension renders its own
 # <release>-otel-restapi in the data-plane namespace, serving /otel on the
@@ -3035,14 +3214,41 @@ fi
 # Verify the images actually running, not the chart version. The gateway chart
 # labels its pods app.kubernetes.io/version=1.2.0 even when the images are
 # 1.2.1, so the label is actively misleading — the guide says to check the images.
-GW_IMAGES=$(kubectl get pods -n "${DATA_PLANE_NS}" -o jsonpath='{..image}' 2>/dev/null \
-    | tr ' ' '\n' | grep -E 'gateway-(controller|runtime)' | sort -u)
-if [ -n "${GW_IMAGES}" ]; then
-    if echo "${GW_IMAGES}" | grep -q ':1\.2\.1$'; then
-        success "Gateway images pinned: $(echo "${GW_IMAGES}" | tr '\n' ' ')"
+# Matched exactly against GATEWAY_*_IMAGE:TAG, since a custom image need not
+# carry "gateway-controller"/"gateway-runtime" in its name.
+GW_EXPECTED_CONTROLLER="${GATEWAY_CONTROLLER_IMAGE}:${GATEWAY_CONTROLLER_TAG}"
+GW_EXPECTED_RUNTIME="${GATEWAY_RUNTIME_IMAGE}:${GATEWAY_RUNTIME_TAG}"
+GW_ALL_IMAGES=$(kubectl get pods -n "${DATA_PLANE_NS}" -o jsonpath='{..image}' 2>/dev/null \
+    | tr ' ' '\n' | sort -u)
+GW_MISSING=""
+for img in "${GW_EXPECTED_CONTROLLER}" "${GW_EXPECTED_RUNTIME}"; do
+    echo "${GW_ALL_IMAGES}" | grep -qxF "${img}" || GW_MISSING="${GW_MISSING} ${img}"
+done
+if [ -z "${GW_MISSING}" ]; then
+    success "Gateway images pinned: ${GW_EXPECTED_CONTROLLER} ${GW_EXPECTED_RUNTIME}"
+else
+    warning "Expected gateway image(s) not running:${GW_MISSING}"
+    warning "Running: $(echo "${GW_ALL_IMAGES}" | grep -E 'gateway' | tr '\n' ' ')"
+    warning "Check the four gateway image overrides in Step 13 (an existing gateway-operator keeps its install-time values)"
+fi
+
+# ── Redis for the gateway policies ───────────────────────────────────────────
+# semantic-cache needs a vector store (Redis with the Query Engine, or
+# Milvus); the rate-limit policies can share counters through it. Delegated to
+# amp-redis.sh, which is also how it is managed after the install — it writes
+# its own audit record. After the gateway extension, so its reachability check
+# runs from the gateway's namespace.
+if [ "${DEPLOY_REDIS}" = "true" ]; then
+    step "Redis for gateway policies (semantic cache, rate limits)"
+    REDIS_RC=0
+    REDIS_OUT=$("$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/amp-redis.sh" install --yes \
+        --reason "${AUDIT_REASON:-installed by amp-install-rancher.sh}" 2>&1) || REDIS_RC=$?
+    # Its own step headers would clash with this script's numbering.
+    echo "${REDIS_OUT}" | grep -vE '^\s*$|\[Step [0-9]+\]|rollout to finish' || true
+    if [ "${REDIS_RC}" -eq 0 ]; then
+        success "Redis ready — configure semantic guardrails with scripts/amp-guardrails.sh configure"
     else
-        warning "Gateway images are NOT 1.2.1: $(echo "${GW_IMAGES}" | tr '\n' ' ')"
-        warning "The chart default (1.2.0) won — check the four image.tag overrides in Step 13"
+        error "Redis install failed (exit ${REDIS_RC}) — re-run: scripts/amp-redis.sh install"
     fi
 fi
 
@@ -3417,8 +3623,10 @@ if curl -fsSL "${SCRIPTS_BASE_URL}/add-environment-thunder.sh" -o "${ADD_ENV_THU
         [ "${attempt}" -lt 3 ] && sleep 20
     done
 
-    kill "${ENV_THUNDER_WATCHER}" 2>/dev/null || true
-    kill "${PF_API_PID}" "${PF_TH_PID}" 2>/dev/null || true
+    # Reaped with wait so bash does not print a "Terminated: 15" job notice
+    # for each helper — expected kills, not failures.
+    kill "${ENV_THUNDER_WATCHER}" "${PF_API_PID}" "${PF_TH_PID}" 2>/dev/null || true
+    wait "${ENV_THUNDER_WATCHER}" "${PF_API_PID}" "${PF_TH_PID}" 2>/dev/null || true
     rm -rf "${ENV_THUNDER_DIR}"
 
     if [ "${ENV_THUNDER_OK}" != "true" ]; then
@@ -3475,8 +3683,15 @@ export ENV_THUNDER_ISSUER
 export ENV_THUNDER_JWKS="http://${ENV_THUNDER_RELEASE}-service.${ENV_THUNDER_RELEASE}.svc.cluster.local:8090/oauth2/jwks"
 
 if kubectl get ns "${ENV_THUNDER_RELEASE}" &>/dev/null; then
+    # Waits on the Deployment, not `pod --all`. On a re-run the helm upgrade
+    # briefly reverts the post-install patches (CA mount, pull policy), so a
+    # second ReplicaSet starts a pod and the re-applied patches delete it within
+    # the same second. `kubectl wait pod --all` lists that terminating pod and,
+    # once it is gone, never notices — it sits out the whole 300s timeout on a
+    # healthy Thunder. rollout status follows whichever ReplicaSet is current.
     wait_for "env-Thunder pods" \
-        kubectl wait --for=condition=Ready pod --all -n "${ENV_THUNDER_RELEASE}" --timeout=300s
+        kubectl rollout status deployment "${ENV_THUNDER_RELEASE}-deployment" \
+        -n "${ENV_THUNDER_RELEASE}" --timeout=300s
     success "env-Thunder issuer: ${ENV_THUNDER_ISSUER}"
 else
     error "Namespace ${ENV_THUNDER_RELEASE} not created — env-Thunder provisioning did not complete"
@@ -3753,6 +3968,13 @@ if [ "${DEPLOY_REGISTRY}" = "true" ]; then
     echo -e "  builds later fail to pull, re-run this installer — it is idempotent."
 fi
 
+if [ "${DEPLOY_REDIS}" = "true" ]; then
+    echo ""
+    echo -e "${BOLD}Redis (gateway policies):${NC}"
+    echo -e "  Endpoint:  redis.${REDIS_NS:-amp-redis}.svc.cluster.local:6379  (password: Secret ${REDIS_NS:-amp-redis}/redis)"
+    echo -e "  Semantic cache needs it — enable with ${BOLD}scripts/amp-guardrails.sh configure${NC}"
+fi
+
 echo ""
 echo -e "${BOLD}════════════════════════════════════════════════════════════════${NC}"
 echo -e "${BOLD} Trust the CA                                                   ${NC}"
@@ -3858,4 +4080,12 @@ if [ "${PROFILE}" = "local" ]; then
     echo ""
     echo -e "If you create a new environment, such as staging, from AMP console, you need to"
     echo -e "add a line in /etc/hosts per environment with: ${BOLD}scripts/amp-hosts.sh add <project>${NC}"
+fi
+
+# ── Audit record ─────────────────────────────────────────────────────────────
+audit_record_helm_changes
+if [ "${ERRORS}" -gt 0 ]; then
+    audit_commit "with-errors" "install v${VERSION} (${PROFILE}, ${BASE_DOMAIN}) completed with ${ERRORS} error(s); gateway ${GW_CTRL_REF##*/}"
+else
+    audit_commit "success" "install v${VERSION} (${PROFILE}, ${BASE_DOMAIN}); gateway ${GW_CTRL_REF##*/}"
 fi
