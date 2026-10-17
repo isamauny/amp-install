@@ -4,7 +4,7 @@ A step-by-step checklist for running `scripts/amp-install-rancher.sh` with `PROF
 
 > **The cloud profile has never completed a verified end-to-end install.** The script refuses to run it without `ALLOW_UNTESTED_CLOUD=1`. Use a cluster you are willing to throw away, and expect to find things this list does not cover yet — add them here when you do.
 
-Placeholders used throughout: `<cluster>` (DOKS cluster name), `<region>` (e.g. `fra1`), `<registry>` (DOCR registry name), `<you@example.com>` (ACME contact). The base domain is `amp.apis.coach` — the local Rancher cluster uses `local.apis.coach`, so the two never collide.
+Placeholders used throughout: `<cluster>` (DOKS cluster name), `<region>` (e.g. `fra1`), `<you@example.com>` (ACME contact). The container registry is the Nexus at `repo.apis.coach:445`, Docker hosted repository `agent-manager`. The base domain is `amp.apis.coach` — the local Rancher cluster uses `local.apis.coach`, so the two never collide.
 
 ---
 
@@ -59,20 +59,32 @@ The guide needs wildcard certificates (`*.amp.apis.coach`, `*.agents.amp.apis.co
 
 > **Rate limit:** the script always uses the Let's Encrypt **production** server (no staging override yet — see Known gaps). Let's Encrypt issues at most 5 identical certificates per week, so repeated reinstalls of a throwaway cluster can lock you out for days.
 
-## 4. Container registry (DOCR)
+## 4. Container registry (Nexus)
 
-Agent builds push their images here and the data plane pulls them from here.
+Agent builds push their images here and the data plane pulls them from here. Every build pushes a **new, uniquely named image**; a Nexus Docker hosted repository accepts any image name under it, so nothing has to be pre-created.
 
-- [ ] Create the registry. According to the guide, every build pushes to a **new, uniquely named repository**, and the custom gateway images add two more. Starter (1 repository) and Basic (5) will run out quickly — plan on **Professional**, and check DO's current tier limits.
+Nexus uses **path-based routing** on port 445 (the same port serves the UI), so the repository name is part of every image reference: `repo.apis.coach:445/agent-manager/<image>:<tag>`. A push without `agent-manager/` fails with `405 Method Not Allowed`.
+
+- [ ] Nexus settings (all done on 2026-10-17):
+  - Security → Realms: **Docker Bearer Token Realm** active. Without it the registry challenges with `BASIC` and anonymous pulls cannot work; a half-applied realm setup also makes `docker login` fail with `401` on `/v2/` even with correct credentials.
+  - Security → Anonymous Access: enabled.
+  - Repository `agent-manager`: **Allow anonymous docker pull** ticked.
+- [ ] Why anonymous pull: the agent Deployments carry **no `imagePullSecrets`** in the chart, and OpenChoreo creates the `dp-*` namespaces later, so there is nowhere to put a pull secret. DOKS nodes pull without credentials. Anyone who knows an image name can pull it — acceptable for this cluster; a private repo would need something (e.g. a Kyverno policy) to add a pull secret to every new `dp-*` namespace's `default` ServiceAccount.
+- [ ] Check the repository's **Deployment policy**: with "Disable redeploy", a rebuild that reuses a tag is rejected.
+- [ ] Verify the nodes can reach port 445 (some networks block it — it is the SMB port). `401` means reachable:
   ```bash
-  doctl registry create <registry> --subscription-tier professional --region <region>
+  kubectl run nexus-probe --rm -i --restart=Never --image=curlimages/curl -- \
+    curl -sS -o /dev/null -w '%{http_code}\n' --max-time 10 https://repo.apis.coach:445/v2/
   ```
-- [ ] Give the cluster pull access:
+- [ ] Verify a node can actually pull. The image must be **amd64** — the Mac's local images are arm64:
   ```bash
-  doctl kubernetes cluster registry add <cluster>
+  docker pull --platform linux/amd64 busybox
+  docker tag busybox repo.apis.coach:445/agent-manager/pull-test:amd64
+  docker push repo.apis.coach:445/agent-manager/pull-test:amd64
+  kubectl run nexus-pull-test --rm -i --restart=Never \
+    --image=repo.apis.coach:445/agent-manager/pull-test:amd64 -- echo pulled
   ```
-  The agent Deployments carry **no `imagePullSecrets`** in the chart, so pulls rely on DO adding the registry secret to the `default` ServiceAccount — including in the `dp-*` namespaces OpenChoreo creates later. **Verify on the first agent deploy** (step 9).
-- [ ] Push credentials are a separate step **after** install (step 9) — the installer does not set them.
+- [ ] Push credentials are a separate step **after** install (step 9) — the installer does not set them. Create a dedicated Nexus user for it with push rights on `agent-manager` only (e.g. a role with `nx-repository-view-docker-agent-manager-*`), not admin.
 
 > **Do not use `DEPLOY_REGISTRY=true` on DOKS**, even though the script's error message suggests it. The node-side half of that setup is `rdctl` + `dockerd`-specific; DOKS nodes run containerd, so every image pull would fail.
 
@@ -85,10 +97,10 @@ Every gateway image on the Mac is `linux/arm64`. The installer's effective defau
 
 **Option B — the custom gateway build.**
 - [ ] Run the gateway builder on an **amd64 host** (a small DO Droplet, or a GitHub Actions `ubuntu-latest` runner) rather than under emulation on the Mac. `ghcr.io/wso2/api-platform/gateway-builder:1.2.1` is published for `linux/amd64`.
-- [ ] Push to DOCR with a tag that does **not** exist on the Mac (so pre-flight doesn't inspect the arm64 copy instead):
+- [ ] Push to Nexus with a tag that does **not** exist on the Mac (so pre-flight doesn't inspect the arm64 copy instead). The node pulls these anonymously too (step 4):
   ```bash
-  doctl registry login
-  REG=registry.digitalocean.com/<registry>
+  docker login repo.apis.coach:445        # host and port only, no /agent-manager
+  REG=repo.apis.coach:445/agent-manager
   docker tag <built-controller> $REG/gateway-controller:1.2.1-p1
   docker tag <built-runtime>    $REG/gateway-runtime:1.2.1-p1
   docker push $REG/gateway-controller:1.2.1-p1
@@ -111,15 +123,15 @@ Keep every setting in one file so re-runs use exactly the same values — a re-r
   export ACME_EMAIL=<you@example.com>
   export TLS_ACME_SOLVER_FILE=$HOME/amp-do/do-solver.yaml
 
-  export REGISTRY_ENDPOINT=registry.digitalocean.com/<registry>
+  export REGISTRY_ENDPOINT=repo.apis.coach:445/agent-manager   # REGISTRY_TLS_VERIFY stays true (Let's Encrypt cert)
   export DEPLOY_REDIS=true          # DO's managed cache is Valkey: no Redis Query Engine, so no semantic-cache
 
   # Option A
   export GATEWAY_CONTROLLER_IMAGE=ghcr.io/wso2/api-platform/gateway-controller GATEWAY_CONTROLLER_TAG=1.2.1
   export GATEWAY_RUNTIME_IMAGE=ghcr.io/wso2/api-platform/gateway-runtime       GATEWAY_RUNTIME_TAG=1.2.1
-  # Option B (instead of A)
-  # export GATEWAY_CONTROLLER_IMAGE=registry.digitalocean.com/<registry>/gateway-controller GATEWAY_CONTROLLER_TAG=1.2.1-p1
-  # export GATEWAY_RUNTIME_IMAGE=registry.digitalocean.com/<registry>/gateway-runtime       GATEWAY_RUNTIME_TAG=1.2.1-p1
+  # Option B (instead of A) — the images actually built and pushed (amd64, verified 2026-10-17)
+  # export GATEWAY_CONTROLLER_IMAGE=repo.apis.coach:445/agent-manager/demo-ai-gateway-gateway-controller GATEWAY_CONTROLLER_TAG=1.2.0.15
+  # export GATEWAY_RUNTIME_IMAGE=repo.apis.coach:445/agent-manager/demo-ai-gateway-gateway-runtime       GATEWAY_RUNTIME_TAG=1.2.0.15
   # export GATEWAY_POLICIES_PATH=./policies
   ```
   Leave `TLS_MODE` off `selfsigned` — browsers would reject every hostname, and the script blocks it on this profile anyway.
@@ -158,19 +170,20 @@ Keep every setting in one file so re-runs use exactly the same values — a re-r
 
 ## 9. After install
 
-- [ ] **Store the registry push credentials in OpenBao.** Builds read them from `secret/registry-push-secret` (ExternalSecret with no `property`, so the whole KV entry becomes the `.dockerconfigjson`). The installer never writes this key.
+- [ ] **Store the registry push credentials in OpenBao.** Builds read them from `secret/registry-push-secret` (ExternalSecret with no `property`, so the whole KV entry becomes the `.dockerconfigjson`) and pass it to `podman push --authfile`. The installer never writes this key. The `auths` key is the host and port **without** `/agent-manager`; use the dedicated push user from step 4:
   ```bash
   TOKEN=$(kubectl get secret openbao-root-token -n openbao -o jsonpath='{.data.root-token}' | base64 -d)
-  doctl registry docker-config --read-write \
+  AUTH=$(printf '%s:%s' '<nexus-push-user>' '<password>' | base64)
+  printf '{"auths":{"repo.apis.coach:445":{"auth":"%s"}}}' "$AUTH" \
     | kubectl exec -i -n openbao openbao-0 -c openbao -- \
       sh -c "BAO_ADDR=http://127.0.0.1:8200 BAO_TOKEN=$TOKEN bao kv put secret/registry-push-secret -"
   ```
-  Not yet verified end to end — confirm on the first build that the generated secret looks like `{"auths":{"registry.digitalocean.com":…}}`:
+  Not yet verified end to end — confirm on the first build that the generated secret looks like `{"auths":{"repo.apis.coach:445":…}}`:
   ```bash
   kubectl get externalsecret -A | grep registry-push
   ```
-- [ ] **First agent build:** confirm the push to DOCR succeeds (a new repository appears in `doctl registry repository list-v2`).
-- [ ] **First agent deploy:** confirm the pod pulls its image. On `ImagePullBackOff`, check that the `dp-*` namespace has the DOCR pull secret on its `default` ServiceAccount; re-run `doctl kubernetes cluster registry add <cluster>` if not.
+- [ ] **First agent build:** confirm the push succeeds — a new image appears under `agent-manager` in the Nexus UI (Browse).
+- [ ] **First agent deploy:** confirm the pod pulls its image. On `ImagePullBackOff`, check the event: `401`/`unauthorized` means anonymous pull is off again (step 4); `no match for platform` means an arm64 image.
 - [ ] **Guardrails:** Redis was deployed by the installer (`DEPLOY_REDIS=true`); configure semantic guardrails with `scripts/amp-guardrails.sh configure`.
 - [ ] **Traces:** the certificates are publicly trusted, so Python agents need no `OTEL_EXPORTER_OTLP_CERTIFICATE` here. The export endpoint is `https://default-default.agents.amp.apis.coach/otel`.
 - [ ] `./scripts/amp-audit.sh list` — the install is recorded in the `amp-audit` namespace on this cluster.
@@ -181,7 +194,7 @@ Work around these by hand (as above) until the script is fixed:
 
 1. **Gateway image default is the local `localhost/` build** on every profile, and the pre-flight "image present" check looks at the Mac's Docker, not at what a DOKS node can pull. → Set `GATEWAY_*_IMAGE` explicitly (step 5).
 2. **Policies path detection needs the image locally.** → Set `GATEWAY_POLICIES_PATH=./policies` for a custom build.
-3. **`DEPLOY_REGISTRY=true` is suggested by the cloud error message but cannot work on DOKS** (rdctl/dockerd only). → Use DOCR.
+3. **`DEPLOY_REGISTRY=true` is suggested by the cloud error message but cannot work on DOKS** (rdctl/dockerd only). → Use the external Nexus.
 4. **`secret/registry-push-secret` is never seeded.** → Step 9.
 5. **No Let's Encrypt staging option.** → Mind the rate limit (step 3).
 
@@ -193,4 +206,4 @@ Work around these by hand (as above) until the script is fixed:
   ```
 - [ ] Check DO → Networking → Load Balancers and Volumes for anything left over.
 - [ ] Remove the four DNS records (or keep them for the next attempt — the IPs will change).
-- [ ] Clean up old repositories in DOCR and run garbage collection if you keep the registry.
+- [ ] The Nexus repository outlives the cluster: delete old agent images (or attach a cleanup policy to `agent-manager`), then run the **Admin - Compact blob store** task to reclaim the disk space.

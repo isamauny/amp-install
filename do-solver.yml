@@ -1,0 +1,5 @@
+- dns01:
+    digitalocean:
+      tokenSecretRef:
+        name: digitalocean-dns
+        key: access-token
